@@ -1,0 +1,174 @@
+// Package entity defines data structures and entities used by the web layer of the 3x-ui panel.
+package entity
+
+import (
+	"crypto/tls"
+	"math"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/mhsanaei/3x-ui/v2/util/common"
+	"github.com/mhsanaei/3x-ui/v2/web/network"
+)
+
+// Msg represents a standard API response message with success status, message text, and optional data object.
+type Msg struct {
+	Success bool   `json:"success"` // Indicates if the operation was successful
+	Msg     string `json:"msg"`     // Response message text
+	Obj     any    `json:"obj"`     // Optional data object
+}
+
+// AllSetting contains panel, Xray, and subscription settings.
+type AllSetting struct {
+	// Web server settings
+	WebListen     string `json:"webListen" form:"webListen"`         // Web server listen IP address
+	WebDomain     string `json:"webDomain" form:"webDomain"`         // Web server domain for domain validation
+	WebPort       int    `json:"webPort" form:"webPort"`             // Web server port number
+	WebCertFile   string `json:"webCertFile" form:"webCertFile"`     // Path to SSL certificate file for web server
+	WebKeyFile    string `json:"webKeyFile" form:"webKeyFile"`       // Path to SSL private key file for web server
+	WebBasePath   string `json:"webBasePath" form:"webBasePath"`     // Base path for web panel URLs
+	SessionMaxAge int    `json:"sessionMaxAge" form:"sessionMaxAge"` // Session maximum age in minutes
+
+	// UI settings
+	PageSize             int    `json:"pageSize" form:"pageSize"`                         // Number of items per page in lists
+	ExpireDiff           int    `json:"expireDiff" form:"expireDiff"`                     // Expiration warning threshold in days
+	TrafficDiff          int    `json:"trafficDiff" form:"trafficDiff"`                   // Traffic warning threshold percentage
+	SecurityAlertsEnable bool   `json:"securityAlertsEnable" form:"securityAlertsEnable"` // Show panel security warnings
+	RemarkModel          string `json:"remarkModel" form:"remarkModel"`                   // Remark model pattern for inbounds
+	Datepicker           string `json:"datepicker" form:"datepicker"`                     // Date picker format
+
+	// Security settings
+	TimeLocation    string `json:"timeLocation" form:"timeLocation"`       // Time zone location
+	TwoFactorEnable bool   `json:"twoFactorEnable" form:"twoFactorEnable"` // Enable two-factor authentication
+	TwoFactorToken  string `json:"twoFactorToken" form:"twoFactorToken"`   // Two-factor authentication token
+
+	// Subscription server settings
+	SubEnable                   bool   `json:"subEnable" form:"subEnable"`                                     // Enable subscription server
+	SubJsonEnable               bool   `json:"subJsonEnable" form:"subJsonEnable"`                             // Enable JSON subscription endpoint
+	SubTitle                    string `json:"subTitle" form:"subTitle"`                                       // Subscription title
+	SubSupportUrl               string `json:"subSupportUrl" form:"subSupportUrl"`                             // Subscription support URL
+	SubProfileUrl               string `json:"subProfileUrl" form:"subProfileUrl"`                             // Subscription profile URL
+	SubAnnounce                 string `json:"subAnnounce" form:"subAnnounce"`                                 // Subscription announce
+	SubEnableRouting            bool   `json:"subEnableRouting" form:"subEnableRouting"`                       // Enable routing for subscription
+	SubRoutingRules             string `json:"subRoutingRules" form:"subRoutingRules"`                         // Subscription global routing rules (Only for Happ)
+	SubListen                   string `json:"subListen" form:"subListen"`                                     // Subscription server listen IP
+	SubPort                     int    `json:"subPort" form:"subPort"`                                         // Subscription server port
+	SubPath                     string `json:"subPath" form:"subPath"`                                         // Base path for subscription URLs
+	SubDomain                   string `json:"subDomain" form:"subDomain"`                                     // Domain for subscription server validation
+	SubCertFile                 string `json:"subCertFile" form:"subCertFile"`                                 // SSL certificate file for subscription server
+	SubKeyFile                  string `json:"subKeyFile" form:"subKeyFile"`                                   // SSL private key file for subscription server
+	SubUpdates                  int    `json:"subUpdates" form:"subUpdates"`                                   // Subscription update interval in minutes
+	ExternalTrafficInformEnable bool   `json:"externalTrafficInformEnable" form:"externalTrafficInformEnable"` // Enable external traffic reporting
+	ExternalTrafficInformURI    string `json:"externalTrafficInformURI" form:"externalTrafficInformURI"`       // URI for external traffic reporting
+	RestartXrayOnClientDisable  bool   `json:"restartXrayOnClientDisable" form:"restartXrayOnClientDisable"`   // Restart Xray when clients are auto-disabled by expiry/traffic limit
+	SubEncrypt                  bool   `json:"subEncrypt" form:"subEncrypt"`                                   // Base64-encode subscription responses (not encryption)
+	SubShowInfo                 bool   `json:"subShowInfo" form:"subShowInfo"`                                 // Show client information in subscriptions
+	SubURI                      string `json:"subURI" form:"subURI"`                                           // Subscription server URI
+	SubJsonPath                 string `json:"subJsonPath" form:"subJsonPath"`                                 // Path for JSON subscription endpoint
+	SubJsonURI                  string `json:"subJsonURI" form:"subJsonURI"`                                   // JSON subscription server URI
+	SubClashEnable              bool   `json:"subClashEnable" form:"subClashEnable"`                           // Enable Clash/Mihomo subscription endpoint
+	SubClashPath                string `json:"subClashPath" form:"subClashPath"`                               // Path for Clash/Mihomo subscription endpoint
+	SubClashURI                 string `json:"subClashURI" form:"subClashURI"`                                 // Clash/Mihomo subscription server URI
+	SubJsonFragment             string `json:"subJsonFragment" form:"subJsonFragment"`                         // JSON subscription fragment configuration
+	SubJsonNoises               string `json:"subJsonNoises" form:"subJsonNoises"`                             // JSON subscription noise configuration
+	SubJsonMux                  string `json:"subJsonMux" form:"subJsonMux"`                                   // JSON subscription mux configuration
+	SubJsonRules                string `json:"subJsonRules" form:"subJsonRules"`
+
+	// JSON subscription routing rules
+}
+
+// CheckValid validates all settings in the AllSetting struct, checking IP addresses, ports, SSL certificates, and other configuration values.
+func (s *AllSetting) CheckValid() error {
+	if s.WebListen != "" {
+		ip := net.ParseIP(s.WebListen)
+		if ip == nil {
+			return common.NewError("web listen is not valid ip:", s.WebListen)
+		}
+	}
+
+	if s.SubListen != "" {
+		ip := net.ParseIP(s.SubListen)
+		if ip == nil {
+			return common.NewError("Sub listen is not valid ip:", s.SubListen)
+		}
+	}
+
+	if s.WebPort <= 0 || s.WebPort > math.MaxUint16 {
+		return common.NewError("web port is not a valid port:", s.WebPort)
+	}
+
+	if s.SubPort <= 0 || s.SubPort > math.MaxUint16 {
+		return common.NewError("Sub port is not a valid port:", s.SubPort)
+	}
+
+	if (s.SubPort == s.WebPort) && (s.WebListen == s.SubListen) {
+		return common.NewError("Sub and Web could not use same ip:port, ", s.SubListen, ":", s.SubPort, " & ", s.WebListen, ":", s.WebPort)
+	}
+
+	webTLS := s.WebCertFile != "" && s.WebKeyFile != ""
+	if s.WebCertFile != "" || s.WebKeyFile != "" {
+		_, err := tls.LoadX509KeyPair(s.WebCertFile, s.WebKeyFile)
+		if err != nil {
+			return common.NewErrorf("cert file <%v> or key file <%v> invalid: %v", s.WebCertFile, s.WebKeyFile, err)
+		}
+	}
+
+	subTLS := s.SubCertFile != "" && s.SubKeyFile != ""
+	if s.SubCertFile != "" || s.SubKeyFile != "" {
+		_, err := tls.LoadX509KeyPair(s.SubCertFile, s.SubKeyFile)
+		if err != nil {
+			return common.NewErrorf("cert file <%v> or key file <%v> invalid: %v", s.SubCertFile, s.SubKeyFile, err)
+		}
+	}
+
+	if !network.InsecureHTTPAllowed() && !webTLS && !network.IsLoopbackListen(s.WebListen) {
+		return common.NewErrorf("public panel HTTP is disabled; configure a valid TLS certificate, bind webListen to 127.0.0.1, or explicitly set %s=true", network.AllowInsecureHTTPEnv)
+	}
+
+	if s.SubEnable && !network.InsecureHTTPAllowed() && !subTLS && !network.IsLoopbackListen(s.SubListen) {
+		return common.NewErrorf("public subscription HTTP is disabled; configure a valid TLS certificate, bind subListen to 127.0.0.1, or explicitly set %s=true", network.AllowInsecureHTTPEnv)
+	}
+
+	if s.SubEnable && !network.InsecureHTTPAllowed() {
+		for _, uri := range []string{s.SubURI, s.SubJsonURI, s.SubClashURI} {
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(uri)), "http://") {
+				return common.NewErrorf("subscription URI must use HTTPS; configure TLS or explicitly set %s=true", network.AllowInsecureHTTPEnv)
+			}
+		}
+	}
+
+	if !strings.HasPrefix(s.WebBasePath, "/") {
+		s.WebBasePath = "/" + s.WebBasePath
+	}
+	if !strings.HasSuffix(s.WebBasePath, "/") {
+		s.WebBasePath += "/"
+	}
+	if !strings.HasPrefix(s.SubPath, "/") {
+		s.SubPath = "/" + s.SubPath
+	}
+	if !strings.HasSuffix(s.SubPath, "/") {
+		s.SubPath += "/"
+	}
+
+	if !strings.HasPrefix(s.SubJsonPath, "/") {
+		s.SubJsonPath = "/" + s.SubJsonPath
+	}
+	if !strings.HasSuffix(s.SubJsonPath, "/") {
+		s.SubJsonPath += "/"
+	}
+
+	if !strings.HasPrefix(s.SubClashPath, "/") {
+		s.SubClashPath = "/" + s.SubClashPath
+	}
+	if !strings.HasSuffix(s.SubClashPath, "/") {
+		s.SubClashPath += "/"
+	}
+
+	_, err := time.LoadLocation(s.TimeLocation)
+	if err != nil {
+		return common.NewError("time location not exist:", s.TimeLocation)
+	}
+
+	return nil
+}

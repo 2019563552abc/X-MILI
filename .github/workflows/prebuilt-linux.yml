@@ -1,0 +1,89 @@
+name: Prebuilt Linux Bundle
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build bundle
+        run: |
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          bash -n deploy.sh x-ui.sh
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -e GITHUB_SHA="$COMMIT_SHA" \
+            -v "$PWD:/src" -w /src golang:1.26.2-bookworm sh -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends gcc libc6-dev unzip ca-certificates curl
+              rm -rf build dist
+              mkdir -p build dist
+              CGO_ENABLED=1 go build -ldflags "-w -s" -o build/x-ui main.go
+              chmod +x DockerInit.sh
+              ./DockerInit.sh "${{ matrix.arch }}"
+              cp x-ui.sh build/x-ui.sh
+              cp deploy.sh build/deploy.sh
+              chmod +x build/x-ui.sh
+              chmod +x build/deploy.sh
+              echo "$GITHUB_SHA" > build/.x-mili-commit
+              test -x build/x-ui
+              test -x build/x-ui.sh
+              test -x build/deploy.sh
+              test -d build/bin
+              test -x "build/bin/xray-linux-${{ matrix.arch }}"
+              tar -C build -czf "dist/x-mili-linux-${{ matrix.arch }}.tar.gz" .
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x-mili-linux-${{ matrix.arch }}
+          path: dist/
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "Release tags must start with v followed by a number" >&2; exit 1 ;;
+          esac
+          (
+            cd dist
+            sha256sum x-mili-linux-*.tar.gz > SHA256SUMS
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite an immutable release." >&2
+            exit 1
+          fi
+          gh release create "$TAG" \
+            dist/x-mili-linux-*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "$TAG" --generate-notes

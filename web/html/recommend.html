@@ -1,0 +1,124 @@
+{{ template "page/head_start" .}}
+{{ template "page/head_end" .}}
+
+{{ template "page/body_start" .}}
+<a-layout id="app" v-cloak :class="themeSwitcher.currentTheme + ' recommend-page'">
+  <a-sidebar></a-sidebar>
+  <a-layout id="content-layout">
+    <a-layout-content>
+      <a-row :gutter="[16, 16]">
+        <a-col :span="24">
+          <a-card hoverable class="recommend-hero">
+            <div class="recommend-hero-main">
+              <div>
+                <div class="recommend-kicker">项目说明</div>
+                <h2>Aimili-Xray</h2>
+                <p>本项目基于 X-UI、3X-UI、Aimili-VPNGate 与 VPNGate 开放项目进行二次开发和优化，在面板界面、节点管理、Xray 配置、VPNGate 节点接入、路由体验和本地化适配上做了精简与整合。</p>
+              </div>
+            </div>
+          </a-card>
+        </a-col>
+
+        <a-col :xs="24" :lg="12">
+          <a-card hoverable title="BandwagonHost 搬瓦工">
+            <a-tag color="red">顶级三网优化</a-tag>
+            <p class="recommend-card-text">适合更看重国内访问质量、延迟、线路上限和长期稳定性的用户。</p>
+            <a-button type="primary" icon="select" @click="open('https://bandwagonhost.com/aff.php?aff=81790')">立即查看</a-button>
+          </a-card>
+        </a-col>
+
+        <a-col :xs="24" :lg="12">
+          <a-card hoverable title="RackNerd">
+            <a-tag color="blue">6000GB/月流量</a-tag>
+            <p class="recommend-card-text">适合低成本部署、测试、长期挂机和性价比优先的 VPS 需求。</p>
+            <a-button type="primary" icon="select" @click="open('https://my.racknerd.com/aff.php?aff=18708')">立即查看</a-button>
+          </a-card>
+        </a-col>
+
+      </a-row>
+    </a-layout-content>
+  </a-layout>
+</a-layout>
+{{template "page/body_scripts" .}}
+{{template "component/aSidebar" .}}
+{{template "component/aThemeSwitch" .}}
+<script>
+  const app = new Vue({
+    delimiters: ['[[', ']]'],
+    el: '#app',
+    data: {
+      themeSwitcher,
+    },
+    methods: {
+      open(url) {
+        window.open(url, '_blank', 'noopener,noreferrer');
+      },
+    },
+  });
+</script>
+<style>
+  .recommend-page .ant-layout-content {
+    margin: 24px 16px;
+  }
+
+  .recommend-page .ant-card {
+    min-height: 100%;
+  }
+
+  .recommend-page .recommend-hero .ant-card-body {
+    padding: 28px 32px;
+  }
+
+  .recommend-page .recommend-hero-main {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+  }
+
+  .recommend-page .recommend-kicker {
+    color: var(--color-primary-100);
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  .recommend-page h2 {
+    margin: 4px 0 10px;
+    font-size: 24px;
+    line-height: 1.25;
+  }
+
+  .recommend-page p {
+    margin: 0;
+  }
+
+  .recommend-page .recommend-card-text {
+    margin: 14px 0 18px;
+  }
+
+  .recommend-page .recommend-muted {
+    color: rgba(0, 0, 0, .55);
+    font-size: 13px;
+  }
+
+  .recommend-page.dark .recommend-muted {
+    color: var(--dark-color-text-secondary);
+  }
+
+  @media (max-width: 768px) {
+    .recommend-page .ant-layout-content {
+      margin: .5rem;
+    }
+
+    .recommend-page .recommend-hero-main {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .recommend-page .recommend-actions,
+    .recommend-page .recommend-actions .ant-btn {
+      width: 100%;
+    }
+  }
+</style>
+{{ template "page/body_end" .}}

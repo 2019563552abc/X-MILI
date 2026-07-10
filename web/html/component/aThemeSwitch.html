@@ -1,0 +1,90 @@
+{{define "component/themeSwitchTemplate"}}
+<template>
+  <a-menu :theme="themeSwitcher.currentTheme" mode="inline" selected-keys="">
+    <a-sub-menu>
+      <span slot="title">
+        <a-icon type="bulb" :theme="themeSwitcher.isDarkTheme ? 'filled' : 'outlined'"></a-icon>
+        <span>{{ i18n "menu.theme" }}</span>
+      </span>
+      <a-menu-item id="change-theme" class="ant-menu-theme-switch" @mousedown="themeSwitcher.animationsOff()">
+        <span>{{ i18n "menu.dark" }}</span>
+        <a-switch :style="{ marginLeft: '2px' }" size="small" :default-checked="themeSwitcher.isDarkTheme"
+          @change="themeSwitcher.toggleTheme()"></a-switch>
+      </a-menu-item>
+    </a-sub-menu>
+  </a-menu>
+</template>
+{{end}}
+
+{{define "component/themeSwitchTemplateLogin"}}
+<template>
+  <a-space @mousedown="themeSwitcher.animationsOff()" id="change-theme" direction="vertical" :size="10"
+    :style="{ width: '100%' }">
+    <a-space direction="horizontal" size="small">
+      <a-switch size="small" :default-checked="themeSwitcher.isDarkTheme"
+        @change="themeSwitcher.toggleTheme()"></a-switch>
+      <span>{{ i18n "menu.dark" }}</span>
+    </a-space>
+  </a-space>
+</template>
+{{end}}
+
+{{define "component/aThemeSwitch"}}
+<script>
+  function createThemeSwitcher() {
+    const darkModePreference = localStorage.getItem('dark-mode');
+    const isDarkTheme = darkModePreference === null ? true : darkModePreference === 'true';
+    localStorage.removeItem('isUltraDarkThemeEnabled');
+    document.documentElement.removeAttribute('data-theme');
+    const theme = isDarkTheme ? 'dark' : 'light';
+    document.querySelector('body').setAttribute('class', theme);
+    return {
+      animationsOff() {
+        document.documentElement.setAttribute('data-theme-animations', 'off');
+        const themeAnimations = document.querySelector('#change-theme');
+        themeAnimations.addEventListener('mouseleave', () => {
+          document.documentElement.removeAttribute('data-theme-animations');
+        });
+        themeAnimations.addEventListener('touchend', () => {
+          document.documentElement.removeAttribute('data-theme-animations');
+        });
+      },
+      isDarkTheme,
+      get currentTheme() {
+        return this.isDarkTheme ? 'dark' : 'light';
+      },
+      toggleTheme() {
+        this.isDarkTheme = !this.isDarkTheme;
+        localStorage.setItem('dark-mode', this.isDarkTheme);
+        document.querySelector('body').setAttribute('class', this.isDarkTheme ? 'dark' : 'light');
+        document.getElementById('message').className = themeSwitcher.currentTheme;
+      }
+    };
+  }
+  const themeSwitcher = createThemeSwitcher();
+  Vue.component('a-theme-switch', {
+    template: `{{template "component/themeSwitchTemplate" .}}`,
+    data: () => ({
+      themeSwitcher
+    }),
+    mounted() {
+      this.$message.config({
+        getContainer: () => document.getElementById('message')
+      });
+      document.getElementById('message').className = themeSwitcher.currentTheme;
+    }
+  });
+  Vue.component('a-theme-switch-login', {
+    template: `{{template "component/themeSwitchTemplateLogin" .}}`,
+    data: () => ({
+      themeSwitcher
+    }),
+    mounted() {
+      this.$message.config({
+        getContainer: () => document.getElementById('message')
+      });
+      document.getElementById('message').className = themeSwitcher.currentTheme;
+    }
+  });
+</script>
+{{end}}

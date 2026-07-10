@@ -1,0 +1,252 @@
+{{define "component/sidebar/content"}}
+<template>
+    <div class="ant-sidebar">
+        <a-layout-sider :theme="themeSwitcher.currentTheme" collapsible :collapsed="collapsed"
+            @collapse="(isCollapsed, type) => collapseHandle(isCollapsed, type)" breakpoint="md">
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-main">
+                    <img class="sidebar-brand-logo" src="{{ .base_path }}assets/logo.jpg" alt="Xray-Aimili">
+                    <div class="sidebar-brand-name">Xray-Aimili</div>
+                </div>
+                <div class="sidebar-brand-actions">
+                    <a-button size="small" icon="github" @click.stop="openLink('https://github.com/Aimilibot/X-MILI')">Github</a-button>
+                    <a-button size="small" @click.stop="openLink('https://t.me/arestemple')">
+                        <span class="sidebar-telegram-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <path d="M21.8 4.4 18.5 20c-.2.9-.8 1.1-1.6.7l-5-3.7-2.4 2.3c-.3.3-.5.5-1 .5l.4-5.1 9.3-8.4c.4-.4-.1-.6-.6-.2L6.1 13.3 1.2 11.8c-1-.3-1-1 .2-1.5L20.5 3c.9-.3 1.6.2 1.3 1.4Z"></path>
+                            </svg>
+                        </span>
+                        Telegram
+                    </a-button>
+                </div>
+            </div>
+            <a-menu :theme="themeSwitcher.currentTheme" mode="inline" :selected-keys="activeTab"
+                @click="({key}) => openLink(key)">
+                <a-menu-item v-for="tab in tabs" :key="tab.key">
+                    <a-icon :type="tab.icon"></a-icon>
+                    <span v-text="tab.title"></span>
+                </a-menu-item>
+            </a-menu>
+        </a-layout-sider>
+        <a-drawer placement="left" :closable="false" @close="closeDrawer" :visible="visible"
+            :wrap-class-name="themeSwitcher.currentTheme" :wrap-style="{ padding: 0 }" :style="{ height: '100%' }">
+            <div class="drawer-handle" @click="toggleDrawer" slot="handle">
+                <a-icon :type="visible ? 'close' : 'menu-fold'"></a-icon>
+            </div>
+            <div class="sidebar-brand drawer-brand">
+                <div class="sidebar-brand-main">
+                    <img class="sidebar-brand-logo" src="{{ .base_path }}assets/logo.jpg" alt="Xray-Aimili">
+                    <div class="sidebar-brand-name">Xray-Aimili</div>
+                </div>
+                <div class="sidebar-brand-actions">
+                    <a-button size="small" icon="github" @click.stop="openLink('https://github.com/Aimilibot/X-MILI')">Github</a-button>
+                    <a-button size="small" @click.stop="openLink('https://t.me/arestemple')">
+                        <span class="sidebar-telegram-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" focusable="false">
+                                <path d="M21.8 4.4 18.5 20c-.2.9-.8 1.1-1.6.7l-5-3.7-2.4 2.3c-.3.3-.5.5-1 .5l.4-5.1 9.3-8.4c.4-.4-.1-.6-.6-.2L6.1 13.3 1.2 11.8c-1-.3-1-1 .2-1.5L20.5 3c.9-.3 1.6.2 1.3 1.4Z"></path>
+                            </svg>
+                        </span>
+                        Telegram
+                    </a-button>
+                </div>
+            </div>
+            <a-menu :theme="themeSwitcher.currentTheme" mode="inline" :selected-keys="activeTab"
+                @click="({key}) => openLink(key)">
+                <a-menu-item v-for="tab in tabs" :key="tab.key">
+                    <a-icon :type="tab.icon"></a-icon>
+                    <span v-text="tab.title"></span>
+                </a-menu-item>
+            </a-menu>
+        </a-drawer>
+    </div>
+</template>
+{{end}}
+
+{{define "component/aSidebar"}}
+<style>
+    .ant-sidebar>.ant-layout-sider {
+        height: 100%;
+    }
+
+    .sidebar-brand {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        min-height: 112px;
+        padding: 14px 10px;
+        overflow: hidden;
+    }
+
+    .sidebar-brand-main {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        min-width: 0;
+    }
+
+    .sidebar-brand-logo {
+        flex: 0 0 44px;
+        width: 44px;
+        height: 44px;
+        object-fit: contain;
+        border-radius: 10px;
+    }
+
+    .sidebar-brand-name {
+        color: var(--color-primary-100);
+        font-size: 18px;
+        font-weight: 700;
+        line-height: 1.2;
+        white-space: nowrap;
+    }
+
+    .sidebar-brand-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+    }
+
+    .sidebar-brand-actions .ant-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        height: 26px;
+        width: 100%;
+        padding: 0 5px;
+        overflow: hidden;
+        color: var(--color-primary-100);
+        border-color: rgba(0, 135, 113, .55);
+        background: rgba(0, 135, 113, .08);
+        border-radius: 999px;
+        font-size: 11px;
+        text-align: center;
+    }
+
+    .sidebar-telegram-icon {
+        display: inline-flex;
+        width: 13px;
+        height: 13px;
+    }
+
+    .sidebar-telegram-icon svg {
+        width: 13px;
+        height: 13px;
+        fill: currentColor;
+    }
+
+    .ant-layout-sider-collapsed .sidebar-brand {
+        justify-content: center;
+        min-height: 72px;
+        padding: 14px 0;
+    }
+
+    .ant-layout-sider-collapsed .sidebar-brand-name,
+    .ant-layout-sider-collapsed .sidebar-brand-actions {
+        display: none;
+    }
+
+</style>
+
+<script>
+    const SIDEBAR_COLLAPSED_KEY = "isSidebarCollapsed"
+
+    Vue.component('a-sidebar', {
+        data() {
+            const developerMode = localStorage.getItem('developerMode') === 'true';
+            return {
+                tabs: developerMode ? [{
+                        key: '{{ .base_path }}panel/',
+                        icon: 'dashboard',
+                        title: '{{ i18n "menu.dashboard"}}'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/inbounds',
+                        icon: 'user',
+                        title: '{{ i18n "menu.inbounds"}}'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/settings',
+                        icon: 'setting',
+                        title: '{{ i18n "menu.settings"}}'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/recommend',
+                        icon: 'like',
+                        title: '产品推荐'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/xray',
+                        icon: 'tool',
+                        title: '{{ i18n "menu.xray"}}'
+                    },
+                ] : [{
+                        key: '{{ .base_path }}panel/',
+                        icon: 'dashboard',
+                        title: '控制台'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/inbounds',
+                        icon: 'deployment-unit',
+                        title: '订阅节点'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/xray?tab=outbounds',
+                        icon: 'cloud-server',
+                        title: '落地节点'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/xray?tab=routing',
+                        icon: 'branches',
+                        title: '出站规则'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/settings',
+                        icon: 'setting',
+                        title: '面板设置'
+                    },
+                    {
+                        key: '{{ .base_path }}panel/recommend',
+                        icon: 'like',
+                        title: '产品推荐'
+                    },
+                ],
+                activeTab: [
+                    '{{ .request_uri }}'
+                ],
+                visible: false,
+                collapsed: this.getStoredCollapsed(),
+            }
+        },
+        methods: {
+            getStoredCollapsed() {
+                try {
+                    return JSON.parse(localStorage.getItem(SIDEBAR_COLLAPSED_KEY)) || false;
+                } catch (_) {
+                    return false;
+                }
+            },
+            openLink(key) {
+                return key.startsWith('http') ?
+                    window.open(key, '_blank', 'noopener,noreferrer') :
+                    location.href = key
+            },
+            closeDrawer() {
+                this.visible = false;
+            },
+            toggleDrawer() {
+                this.visible = !this.visible;
+            },
+            collapseHandle(collapsed, type) {
+                if (type === "clickTrigger") {
+                    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed);
+
+                    this.collapsed = this.getStoredCollapsed();
+                }
+            }
+        },
+        template: `{{template "component/sidebar/content" .}}`,
+    });
+</script>
+{{end}}

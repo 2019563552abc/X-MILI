@@ -1,0 +1,586 @@
+{{define "modals/inboundModal"}}
+<a-modal id="inbound-modal" v-model="inModal.visible" :title="inModal.title" :dialog-style="{ top: '20px' }"
+    @ok="inModal.ok" :confirm-loading="inModal.confirmLoading" :closable="true" :mask-closable="false"
+    :class="themeSwitcher.currentTheme" wrap-class-name="inbound-modal-left" :ok-text="inModal.okText"
+    cancel-text='{{ i18n "close" }}'>
+    <template v-if="simpleMode && !isEdit">
+        <a-form :colon="false" :label-col="{ md: {span:8} }" :wrapper-col="{ md: {span:14} }">
+            <a-form-item label='{{ i18n "remark" }}'>
+                <a-input v-model.trim="dbInbound.remark"></a-input>
+            </a-form-item>
+            <a-form-item label="类型">
+                <a-select v-model="simpleInboundType" @change="applySimpleInbound">
+                    <a-select-option value="vless-reality">VLESS (Reality)</a-select-option>
+                    <a-select-option value="vless-ws">VLESS (WebSocket)</a-select-option>
+                    <a-select-option value="mixed">Mixed</a-select-option>
+                </a-select>
+            </a-form-item>
+            <a-form-item label='{{ i18n "pages.inbounds.port" }}'>
+                <a-input-number v-model.number="inbound.port" :min="1" :max="65535"></a-input-number>
+                <a-button size="small" icon="reload" :style="{ marginLeft: '8px' }" @click="randomPort"></a-button>
+            </a-form-item>
+
+            <template v-if="simpleInboundType === 'vless-reality'">
+                <a-form-item label="伪装网站">
+                    <a-input v-model.trim="simpleRealitySite"></a-input>
+                    <a-button size="small" icon="reload" :style="{ marginTop: '8px' }"
+                        @click="randomSimpleRealitySite">随机</a-button>
+                </a-form-item>
+            </template>
+
+            <template v-if="simpleInboundType === 'vless-ws'">
+                <a-form-item label="伪装域名">
+                    <a-input v-model.trim="simpleWsDomain" placeholder="example.com"></a-input>
+                </a-form-item>
+                <a-form-item label="证书">
+                    <div class="simple-cert-actions">
+                        <a-radio-group v-model="inbound.stream.tls.certs[0].useFile" button-style="solid">
+                            <a-radio-button :value="false">内容</a-radio-button>
+                            <a-radio-button :value="true">文件</a-radio-button>
+                        </a-radio-group>
+                        <a-button size="small" icon="import" @click="useDefaultSimpleCert">自动获取</a-button>
+                    </div>
+                </a-form-item>
+                <template v-if="inbound.stream.tls.certs[0].useFile">
+                    <a-form-item label="证书文件">
+                        <a-input v-model.trim="inbound.stream.tls.certs[0].certFile"></a-input>
+                    </a-form-item>
+                    <a-form-item label="私钥文件">
+                        <a-input v-model.trim="inbound.stream.tls.certs[0].keyFile"></a-input>
+                    </a-form-item>
+                </template>
+                <template v-else>
+                    <a-form-item label="证书内容">
+                        <a-textarea v-model="inbound.stream.tls.certs[0].cert" :auto-size="{ minRows: 4 }"></a-textarea>
+                    </a-form-item>
+                    <a-form-item label="私钥内容">
+                        <a-textarea v-model="inbound.stream.tls.certs[0].key" :auto-size="{ minRows: 4 }"></a-textarea>
+                    </a-form-item>
+                </template>
+            </template>
+
+            <template v-if="simpleInboundType === 'mixed'">
+                <a-form-item label='{{ i18n "pages.inbounds.enable" }} UDP'>
+                    <a-switch v-model="inbound.settings.udp"></a-switch>
+                </a-form-item>
+                <a-form-item label="IP" v-if="inbound.settings.udp">
+                    <a-input v-model.trim="inbound.settings.ip"></a-input>
+                </a-form-item>
+                <a-form-item label='{{ i18n "password" }}'>
+                    <a-switch :checked="inbound.settings.auth === 'password'"
+                        @change="checked => inbound.settings.auth = checked ? 'password' : 'noauth'"></a-switch>
+                </a-form-item>
+                <template v-if="inbound.settings.auth === 'password'">
+                    <a-input-group compact v-for="(account, index) in inbound.settings.accounts"
+                        :style="{ marginBottom: '10px' }">
+                        <a-input :style="{ width: '50%' }" v-model.trim="account.user" placeholder='{{ i18n "username" }}'>
+                            <template slot="addonBefore">[[ index+1 ]]</template>
+                        </a-input>
+                        <a-input :style="{ width: '50%' }" v-model.trim="account.pass" placeholder='{{ i18n "password" }}'>
+                            <template slot="addonAfter">
+                                <a-button icon="minus" size="small" @click="inbound.settings.delAccount(index)"></a-button>
+                            </template>
+                        </a-input>
+                    </a-input-group>
+                    <a-button icon="plus" size="small"
+                        @click="inbound.settings.addAccount(new Inbound.MixedSettings.SocksAccount())"></a-button>
+                </template>
+            </template>
+        </a-form>
+    </template>
+    <template v-else>
+        {{template "form/inbound" .}}
+    </template>
+</a-modal>
+<style>
+    .inbound-modal-left .ant-form-item-label,
+    .inbound-modal-left .ant-form-item-control,
+    .inbound-modal-left .ant-collapse-header {
+        text-align: left;
+    }
+
+    .inbound-modal-left .simple-cert-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+</style>
+<script>
+    // Make inModal globally available to ensure it works with any base path
+    const inModal = (window.inModal = {
+        title: "",
+        visible: false,
+        confirmLoading: false,
+        okText: '{{ i18n "sure" }}',
+        isEdit: false,
+        confirm: null,
+        inbound: new Inbound(),
+        dbInbound: new DBInbound(),
+        async ok() {
+            if (inboundModalVueInstance && !(await inboundModalVueInstance.prepareSimpleInbound())) {
+                return;
+            }
+            ObjectUtil.execute(inModal.confirm, inModal.inbound, inModal.dbInbound);
+        },
+        show({
+            title = "",
+            okText = '{{ i18n "sure" }}',
+            inbound = null,
+            dbInbound = null,
+            confirm = (inbound, dbInbound) => {},
+            isEdit = false,
+        }) {
+            this.title = title;
+            this.okText = okText;
+            if (inbound) {
+                this.inbound = Inbound.fromJson(inbound.toJson());
+            } else {
+                this.inbound = new Inbound();
+            }
+            // Always ensure testseed is initialized for VLESS protocol (even if vision flow is not set yet)
+            // This ensures Vue reactivity works properly
+            if (this.inbound.protocol === Protocols.VLESS && this.inbound.settings) {
+                if (
+                    !this.inbound.settings.testseed ||
+                    !Array.isArray(this.inbound.settings.testseed) ||
+                    this.inbound.settings.testseed.length < 4
+                ) {
+                    // Create a new array to ensure Vue reactivity
+                    this.inbound.settings.testseed = [900, 500, 900, 256].slice();
+                }
+            }
+            if (dbInbound) {
+                this.dbInbound = new DBInbound(dbInbound);
+            } else {
+                this.dbInbound = new DBInbound();
+            }
+            this.confirm = confirm;
+            this.visible = true;
+            this.isEdit = isEdit;
+        },
+        close() {
+            inModal.visible = false;
+            inModal.loading(false);
+        },
+        loading(loading = true) {
+            inModal.confirmLoading = loading;
+        },
+        // Vision Seed methods - always available regardless of Vue context
+        updateTestseed(index, value) {
+            // Use inModal.inbound explicitly to ensure correct context
+            if (!inModal.inbound || !inModal.inbound.settings) return;
+            // Ensure testseed is initialized
+            if (
+                !inModal.inbound.settings.testseed ||
+                !Array.isArray(inModal.inbound.settings.testseed)
+            ) {
+                inModal.inbound.settings.testseed = [900, 500, 900, 256];
+            }
+            // Ensure array has enough elements
+            while (inModal.inbound.settings.testseed.length <= index) {
+                inModal.inbound.settings.testseed.push(0);
+            }
+            // Update value
+            inModal.inbound.settings.testseed[index] = value;
+        },
+        setRandomTestseed() {
+            // Use inModal.inbound explicitly to ensure correct context
+            if (!inModal.inbound || !inModal.inbound.settings) return;
+            // Ensure testseed is initialized
+            if (
+                !inModal.inbound.settings.testseed ||
+                !Array.isArray(inModal.inbound.settings.testseed) ||
+                inModal.inbound.settings.testseed.length < 4
+            ) {
+                inModal.inbound.settings.testseed = [900, 500, 900, 256].slice();
+            }
+            // Create new array with random values
+            inModal.inbound.settings.testseed = [
+                Math.floor(Math.random() * 1000),
+                Math.floor(Math.random() * 1000),
+                Math.floor(Math.random() * 1000),
+                Math.floor(Math.random() * 1000),
+            ];
+        },
+        resetTestseed() {
+            // Use inModal.inbound explicitly to ensure correct context
+            if (!inModal.inbound || !inModal.inbound.settings) return;
+            // Reset testseed to default values
+            inModal.inbound.settings.testseed = [900, 500, 900, 256].slice();
+        },
+    });
+
+    // Store Vue instance globally to ensure methods are always accessible
+    let inboundModalVueInstance = null;
+
+    inboundModalVueInstance = new Vue({
+        delimiters: ["[[", "]]"],
+        el: "#inbound-modal",
+        data: {
+            inModal: inModal,
+            simpleInboundType: "vless-reality",
+            delayedStart: false,
+            get simpleMode() {
+                return localStorage.getItem("developerMode") !== "true";
+            },
+            get inbound() {
+                return inModal.inbound;
+            },
+            get dbInbound() {
+                return inModal.dbInbound;
+            },
+            get isEdit() {
+                return inModal.isEdit;
+            },
+            get client() {
+                return inModal.inbound &&
+                    inModal.inbound.clients &&
+                    inModal.inbound.clients.length > 0 ?
+                    inModal.inbound.clients[0] :
+                    null;
+            },
+            get datepicker() {
+                return app.datepicker;
+            },
+            get delayedExpireDays() {
+                return this.client && this.client.expiryTime < 0 ?
+                    this.client.expiryTime / -86400000 :
+                    0;
+            },
+            set delayedExpireDays(days) {
+                this.client.expiryTime = -86400000 * days;
+            },
+            get externalProxy() {
+                return this.inbound.stream.externalProxy.length > 0;
+            },
+            set externalProxy(value) {
+                if (value) {
+                    inModal.inbound.stream.externalProxy = [{
+                        forceTls: "same",
+                        dest: window.location.hostname,
+                        port: inModal.inbound.port,
+                        remark: "",
+                    }, ];
+                } else {
+                    inModal.inbound.stream.externalProxy = [];
+                }
+            },
+        },
+        computed: {
+            simpleRealitySite: {
+                get() {
+                    const reality = this.inbound.stream.reality;
+                    const sni = (reality.serverNames || "").split(",")[0];
+                    return sni || (reality.target || "").replace(/:\d+$/, "");
+                },
+                set(value) {
+                    const host = (value || "").trim();
+                    this.inbound.stream.reality.target = host.includes(":") ? host : `${host}:443`;
+                    this.inbound.stream.reality.serverNames = host.replace(/:\d+$/, "");
+                },
+            },
+            simpleWsDomain: {
+                get() {
+                    return this.inbound.stream.ws.host || this.inbound.stream.tls.sni;
+                },
+                set(value) {
+                    const host = (value || "").trim();
+                    this.inbound.stream.ws.host = host;
+                    this.inbound.stream.tls.sni = host;
+                },
+            },
+        },
+        watch: {
+            "inModal.visible"(visible) {
+                if (visible && this.simpleMode && !this.isEdit) {
+                    this.applySimpleInbound(this.simpleInboundType);
+                }
+            },
+            "inModal.inbound.stream.security"(newVal, oldVal) {
+                // Clear flow when security changes from reality/tls to none
+                if (
+                    inModal.inbound.protocol == Protocols.VLESS &&
+                    !inModal.inbound.canEnableTlsFlow()
+                ) {
+                    inModal.inbound.settings.vlesses.forEach((client) => {
+                        client.flow = "";
+                    });
+                }
+            },
+            // Ensure testseed is always initialized when vision flow is enabled
+            "inModal.inbound.settings.vlesses": {
+                handler() {
+                    if (
+                        inModal.inbound.protocol === Protocols.VLESS &&
+                        inModal.inbound.settings &&
+                        inModal.inbound.settings.vlesses
+                    ) {
+                        const hasVisionFlow = inModal.inbound.settings.vlesses.some(
+                            (c) =>
+                            c.flow === "xtls-rprx-vision" ||
+                            c.flow === "xtls-rprx-vision-udp443",
+                        );
+                        if (
+                            hasVisionFlow &&
+                            (!inModal.inbound.settings.testseed ||
+                                !Array.isArray(inModal.inbound.settings.testseed) ||
+                                inModal.inbound.settings.testseed.length < 4)
+                        ) {
+                            inModal.inbound.settings.testseed = [900, 500, 900, 256];
+                        }
+                    }
+                },
+                deep: true,
+            },
+        },
+        methods: {
+            async prepareSimpleInbound() {
+                if (!this.simpleMode || this.isEdit) return true;
+
+                if (this.simpleInboundType === "vless-reality" &&
+                    (!this.inbound.stream.reality.privateKey || !this.inbound.stream.reality.settings.publicKey)) {
+                    inModal.loading(true);
+                    const msg = await HttpUtil.get("/panel/api/server/getNewX25519Cert");
+                    inModal.loading(false);
+                    if (!msg.success) return false;
+                    this.inbound.stream.reality.privateKey = msg.obj.privateKey;
+                    this.inbound.stream.reality.settings.publicKey = msg.obj.publicKey;
+                }
+
+                if (this.simpleInboundType === "vless-ws" &&
+                    (!this.simpleWsDomain || !this.simpleWsCertReady())) {
+                    this.$message.warning("请填写伪装域名、证书和私钥");
+                    return false;
+                }
+
+                return true;
+            },
+            applySimpleInbound(type) {
+                this.simpleInboundType = type;
+                const port = type === "vless-reality" ? 443 :
+                    (type === "vless-ws" ? 2053 : (this.inbound.port || RandomUtil.randomInteger(10000, 60000)));
+                inModal.inbound = new Inbound(port);
+
+                if (type === "vless-reality") {
+                    inModal.inbound.protocol = Protocols.VLESS;
+                    inModal.inbound.stream.network = "tcp";
+                    inModal.inbound.stream.security = "reality";
+                    inModal.inbound.stream.reality = new RealityStreamSettings();
+                    inModal.inbound.settings.vlesses[0].flow = TLS_FLOW_CONTROL.VISION;
+                    return;
+                }
+
+                if (type === "vless-ws") {
+                    inModal.inbound.protocol = Protocols.VLESS;
+                    inModal.inbound.stream.network = "ws";
+                    inModal.inbound.stream.security = "tls";
+                    inModal.inbound.stream.ws.path = "/ws";
+                    inModal.inbound.stream.tls.sni = this.simpleWsDomain;
+                    inModal.inbound.stream.ws.host = this.simpleWsDomain;
+                    inModal.inbound.stream.tls.certs[0].useFile = false;
+                    return;
+                }
+
+                inModal.inbound.protocol = Protocols.MIXED;
+            },
+            randomPort() {
+                if (this.simpleInboundType === "vless-reality") {
+                    const ports = [443, 8443, 2053, 2083, 2087, 2096];
+                    this.inbound.port = ports[RandomUtil.randomInteger(0, ports.length - 1)];
+                    return;
+                }
+                if (this.simpleInboundType === "vless-ws") {
+                    const ports = [443, 2053, 2083, 2087, 2096, 8443];
+                    this.inbound.port = ports[RandomUtil.randomInteger(0, ports.length - 1)];
+                    return;
+                }
+                this.inbound.port = RandomUtil.randomInteger(10000, 60000);
+            },
+            simpleWsCertReady() {
+                const cert = this.inbound.stream.tls.certs[0];
+                return cert.useFile ?
+                    cert.certFile && cert.keyFile :
+                    cert.cert && cert.key;
+            },
+            useDefaultSimpleCert() {
+                const cert = this.inbound.stream.tls.certs[0];
+                cert.useFile = true;
+                cert.certFile = app.defaultCert || "";
+                cert.keyFile = app.defaultKey || "";
+            },
+            randomSimpleRealitySite() {
+                this.inbound.stream.reality = new RealityStreamSettings();
+            },
+            streamNetworkChange() {
+                if (!inModal.inbound.canEnableTls()) {
+                    this.inModal.inbound.stream.security = "none";
+                }
+                if (!inModal.inbound.canEnableReality()) {
+                    this.inModal.inbound.reality = false;
+                }
+                if (
+                    this.inModal.inbound.protocol == Protocols.VLESS &&
+                    !inModal.inbound.canEnableTlsFlow()
+                ) {
+                    this.inModal.inbound.settings.vlesses.forEach((client) => {
+                        client.flow = "";
+                    });
+                }
+                if (inModal.inbound.stream.network != "kcp") {
+                    inModal.inbound.stream.finalmask.udp = [];
+                }
+            },
+            SSMethodChange() {
+                this.inModal.inbound.settings.password =
+                    RandomUtil.randomShadowsocksPassword(
+                        this.inModal.inbound.settings.method,
+                    );
+
+                if (this.inModal.inbound.isSSMultiUser) {
+                    if (this.inModal.inbound.settings.shadowsockses.length == 0) {
+                        this.inModal.inbound.settings.shadowsockses = [
+                            new Inbound.ShadowsocksSettings.Shadowsocks(),
+                        ];
+                    }
+                    if (!this.inModal.inbound.isSS2022) {
+                        this.inModal.inbound.settings.shadowsockses.forEach((client) => {
+                            client.method = this.inModal.inbound.settings.method;
+                        });
+                    } else {
+                        this.inModal.inbound.settings.shadowsockses.forEach((client) => {
+                            client.method = "";
+                        });
+                    }
+                    this.inModal.inbound.settings.shadowsockses.forEach((client) => {
+                        client.password = RandomUtil.randomShadowsocksPassword(
+                            this.inModal.inbound.settings.method,
+                        );
+                    });
+                } else {
+                    if (this.inModal.inbound.settings.shadowsockses.length > 0) {
+                        this.inModal.inbound.settings.shadowsockses = [];
+                    }
+                }
+            },
+            setDefaultCertData(index) {
+                inModal.inbound.stream.tls.certs[index].certFile = app.defaultCert;
+                inModal.inbound.stream.tls.certs[index].keyFile = app.defaultKey;
+            },
+            async getNewX25519Cert() {
+                inModal.loading(true);
+                const msg = await HttpUtil.get("/panel/api/server/getNewX25519Cert");
+                inModal.loading(false);
+                if (!msg.success) {
+                    return;
+                }
+                inModal.inbound.stream.reality.privateKey = msg.obj.privateKey;
+                inModal.inbound.stream.reality.settings.publicKey = msg.obj.publicKey;
+            },
+            clearX25519Cert() {
+                this.inbound.stream.reality.privateKey = "";
+                this.inbound.stream.reality.settings.publicKey = "";
+            },
+            async getNewmldsa65() {
+                inModal.loading(true);
+                const msg = await HttpUtil.get("/panel/api/server/getNewmldsa65");
+                inModal.loading(false);
+                if (!msg.success) {
+                    return;
+                }
+                inModal.inbound.stream.reality.mldsa65Seed = msg.obj.seed;
+                inModal.inbound.stream.reality.settings.mldsa65Verify = msg.obj.verify;
+            },
+            clearMldsa65() {
+                this.inbound.stream.reality.mldsa65Seed = "";
+                this.inbound.stream.reality.settings.mldsa65Verify = "";
+            },
+            randomizeRealityTarget() {
+                if (typeof getRandomRealityTarget !== "undefined") {
+                    const randomTarget = getRandomRealityTarget();
+                    this.inbound.stream.reality.target = randomTarget.target;
+                    this.inbound.stream.reality.serverNames = randomTarget.sni;
+                }
+            },
+            async getNewEchCert() {
+                inModal.loading(true);
+                const msg = await HttpUtil.post("/panel/api/server/getNewEchCert", {
+                    sni: inModal.inbound.stream.tls.sni,
+                });
+                inModal.loading(false);
+                if (!msg.success) {
+                    return;
+                }
+                inModal.inbound.stream.tls.echServerKeys = msg.obj.echServerKeys;
+                inModal.inbound.stream.tls.settings.echConfigList =
+                    msg.obj.echConfigList;
+            },
+            clearEchCert() {
+                this.inbound.stream.tls.echServerKeys = "";
+                this.inbound.stream.tls.settings.echConfigList = "";
+            },
+            async getNewVlessEnc() {
+                const selected = inModal.inbound.settings.selectedAuth;
+                if (!selected) {
+                    this.clearVlessEnc();
+                    return;
+                }
+
+                inModal.loading(true);
+                const msg = await HttpUtil.get("/panel/api/server/getNewVlessEnc");
+                inModal.loading(false);
+
+                if (!msg.success) {
+                    return;
+                }
+
+                const auths = msg.obj.auths || [];
+                const block = auths.find((a) => a.label === selected);
+
+                if (!block) {
+                    console.error("No auth block for", selected);
+                    return;
+                }
+
+                inModal.inbound.settings.decryption = block.decryption;
+                inModal.inbound.settings.encryption = block.encryption;
+            },
+            clearVlessEnc() {
+                this.inbound.settings.decryption = "none";
+                this.inbound.settings.encryption = "none";
+                this.inbound.settings.selectedAuth = undefined;
+            },
+            // Vision Seed methods - must be in Vue methods for proper binding
+            updateTestseed(index, value) {
+                // Ensure testseed is initialized
+                if (
+                    !this.inbound.settings.testseed ||
+                    !Array.isArray(this.inbound.settings.testseed)
+                ) {
+                    this.$set(this.inbound.settings, "testseed", [900, 500, 900, 256]);
+                }
+                // Ensure array has enough elements
+                while (this.inbound.settings.testseed.length <= index) {
+                    this.inbound.settings.testseed.push(0);
+                }
+                // Update value using Vue.set for reactivity
+                this.$set(this.inbound.settings.testseed, index, value);
+            },
+            setRandomTestseed() {
+                // Create new array with random values and use Vue.set for reactivity
+                const newSeed = [
+                    Math.floor(Math.random() * 1000),
+                    Math.floor(Math.random() * 1000),
+                    Math.floor(Math.random() * 1000),
+                    Math.floor(Math.random() * 1000),
+                ];
+                this.$set(this.inbound.settings, "testseed", newSeed);
+            },
+            resetTestseed() {
+                // Reset testseed to default values using Vue.set for reactivity
+                this.$set(this.inbound.settings, "testseed", [900, 500, 900, 256]);
+            },
+        },
+    });
+</script>
+{{end}}
