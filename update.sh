@@ -2,8 +2,11 @@
 set -euo pipefail
 
 APP_NAME="X-MILI"
-REPO="https://github.com/Aimilibot/X-MILI"
-API_REPO="https://api.github.com/repos/Aimilibot/X-MILI"
+DEFAULT_REPO="https://github.com/2019563552abc/X-MILI"
+REPO="${X_MILI_REPO:-$DEFAULT_REPO}"
+REPO_SLUG="${REPO#https://github.com/}"
+REPO_SLUG="${REPO_SLUG%.git}"
+API_REPO="${X_MILI_API_REPO:-https://api.github.com/repos/${REPO_SLUG}}"
 INSTALL_DIR="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
 COMMIT_FILE="${INSTALL_DIR}/.x-mili-commit"
 RELEASE_TAG="${X_MILI_RELEASE_TAG:-latest}"
@@ -33,6 +36,15 @@ detect_arch() {
         *) echo "amd64" ;;
     esac
 }
+
+resolve_release_tag() {
+    [[ "$RELEASE_TAG" != "latest" ]] && return
+
+    RELEASE_TAG="$(curl -fsSL "${API_REPO}/releases/latest" | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
+    [[ "$RELEASE_TAG" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || fail "No published version release was found in ${API_REPO}"
+}
+
+resolve_release_tag
 
 remote_commit="$(curl -fsSL "${API_REPO}/git/ref/heads/main" | sed -n 's/.*"sha": "\([0-9a-f]\{40\}\)".*/\1/p' || true)"
 local_commit="$(cat "$COMMIT_FILE" 2>/dev/null || true)"

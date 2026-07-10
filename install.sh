@@ -2,7 +2,11 @@
 set -e
 
 APP_NAME="X-MILI"
-REPO="https://github.com/Aimilibot/X-MILI"
+DEFAULT_REPO="https://github.com/2019563552abc/X-MILI"
+REPO="${X_MILI_REPO:-$DEFAULT_REPO}"
+REPO_SLUG="${REPO#https://github.com/}"
+REPO_SLUG="${REPO_SLUG%.git}"
+API_REPO="${X_MILI_API_REPO:-https://api.github.com/repos/${REPO_SLUG}}"
 RELEASE_TAG="${X_MILI_RELEASE_TAG:-latest}"
 INSTALL_DIR="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
 DATA_DIR="/etc/x-ui"
@@ -65,6 +69,13 @@ detect_arch() {
         armv7* | armv6* | arm*) echo "arm" ;;
         *) echo "amd64" ;;
     esac
+}
+
+resolve_release_tag() {
+    [[ "$RELEASE_TAG" != "latest" ]] && return
+
+    RELEASE_TAG="$(curl -fsSL "${API_REPO}/releases/latest" | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
+    [[ "$RELEASE_TAG" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || fail "No published version release was found in ${API_REPO}"
 }
 
 clean_old_runtime() {
@@ -296,6 +307,7 @@ is_zh && log "开始安装/更新 ${APP_NAME}" || log "Installing/updating ${APP
 command -v systemctl >/dev/null 2>&1 || fail "需要 systemd / systemd is required"
 is_zh && step 1 5 "安装运行依赖和 OpenVPN" || step 1 5 "Installing runtime dependencies and OpenVPN"
 install_runtime_deps
+resolve_release_tag
 is_zh && step 2 5 "清理旧程序文件，保留面板数据" || step 2 5 "Cleaning old runtime files, keeping panel data"
 clean_old_runtime
 
