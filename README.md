@@ -47,6 +47,8 @@ X-MILI 是一个简洁版代理面板：
 bash <(curl -Ls https://raw.githubusercontent.com/2019563552abc/X-MILI/main/install.sh)
 ```
 
+安装器默认将未配置 TLS 的面板限制在 `127.0.0.1`。公网访问请优先配置 HTTPS 反向代理或面板证书；仅在临时兼容场景下，才显式设置 `X_MILI_ALLOW_INSECURE_HTTP=true`，并尽快恢复 TLS。
+
 ### Docker 版
 
 适合快速部署、隔离运行和保留数据目录。

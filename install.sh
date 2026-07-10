@@ -8,6 +8,7 @@ REPO_SLUG="${REPO#https://github.com/}"
 REPO_SLUG="${REPO_SLUG%.git}"
 API_REPO="${X_MILI_API_REPO:-https://api.github.com/repos/${REPO_SLUG}}"
 RELEASE_TAG="${X_MILI_RELEASE_TAG:-latest}"
+INSECURE_HTTP_OPT_IN="${X_MILI_ALLOW_INSECURE_HTTP:-false}"
 INSTALL_DIR="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
 DATA_DIR="/etc/x-ui"
 LANG_DIR="/etc/x-mili"
@@ -100,6 +101,28 @@ get_server_ip() {
     ip=$(curl -s --max-time 3 https://api.ipify.org || true)
     [[ -n "$ip" ]] || ip=$(curl -s --max-time 3 https://4.ident.me || true)
     [[ -n "$ip" ]] && echo "$ip" || echo "服务器IP"
+}
+
+insecure_http_opted_in() {
+    [[ "${INSECURE_HTTP_OPT_IN,,}" == "true" ]]
+}
+
+configure_http_exposure() {
+    local env_file="/etc/default/x-ui"
+    local temporary_env
+
+    temporary_env="$(mktemp "${env_file}.XXXXXX")"
+    if [[ -f "$env_file" ]]; then
+        sed '/^[[:space:]]*XUI_ALLOW_INSECURE_HTTP=/d' "$env_file" > "$temporary_env"
+    fi
+
+    if insecure_http_opted_in; then
+        printf 'XUI_ALLOW_INSECURE_HTTP=true\n' >> "$temporary_env"
+        "${INSTALL_DIR}/x-ui" setting -listenIP "0.0.0.0" >/dev/null
+    fi
+
+    chmod 0600 "$temporary_env"
+    mv -f "$temporary_env" "$env_file"
 }
 
 normalize_web_path() {
@@ -197,7 +220,7 @@ init_panel_settings() {
 }
 
 print_install_guide() {
-    local info port web_path server_ip cert protocol listen_ip
+    local info port web_path server_ip cert protocol listen_ip public_http=0
     info=$("${INSTALL_DIR}/x-ui" setting -show true 2>/dev/null || true)
     port=$(extract_setting "$info" "port")
     web_path=$(extract_setting "$info" "webBasePath")
@@ -207,7 +230,10 @@ print_install_guide() {
     cert=$("${INSTALL_DIR}/x-ui" setting -getCert true 2>/dev/null | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]' || true)
     listen_ip=$("${INSTALL_DIR}/x-ui" setting -getListen true 2>/dev/null | awk -F': ' '/^listenIP:/ {print $2; exit}' | tr -d '[:space:]' || true)
     [[ -n "$cert" ]] && protocol="https" || protocol="http"
-    if [[ -z "$cert" && ( -z "$listen_ip" || "$listen_ip" == "127.0.0.1" || "$listen_ip" == "::1" || "$listen_ip" == "localhost" ) ]]; then
+    if insecure_http_opted_in; then
+        public_http=1
+    fi
+    if [[ -z "$cert" && "$public_http" != "1" ]]; then
         server_ip="127.0.0.1"
     fi
 
@@ -224,6 +250,11 @@ print_install_guide() {
             echo -e "登录信息: ${yellow}已保留现有账号和密码${plain}"
         fi
         echo -e "数据目录: ${yellow}${DATA_DIR}${plain}"
+        if [[ -z "$cert" && "$public_http" != "1" ]]; then
+            echo -e "${yellow}面板仅监听本机地址。请配置 TLS 后公网访问，或通过 SSH 隧道访问：ssh -L ${port}:127.0.0.1:${port} root@服务器IP${plain}"
+        elif [[ -z "$cert" ]]; then
+            echo -e "${red}已显式启用公网明文 HTTP。请尽快配置 TLS，避免账号和订阅信息泄露。${plain}"
+        fi
         echo -e "${green}=================================================${plain}"
     else
         echo -e "${green}================ X-MILI Installed ================${plain}"
@@ -237,6 +268,11 @@ print_install_guide() {
             echo -e "Login: ${yellow}existing username and password preserved${plain}"
         fi
         echo -e "Data directory: ${yellow}${DATA_DIR}${plain}"
+        if [[ -z "$cert" && "$public_http" != "1" ]]; then
+            echo -e "${yellow}The panel is bound to localhost only. Configure TLS for public access, or use: ssh -L ${port}:127.0.0.1:${port} root@server-ip${plain}"
+        elif [[ -z "$cert" ]]; then
+            echo -e "${red}Public plaintext HTTP was explicitly enabled. Configure TLS immediately to protect credentials and subscriptions.${plain}"
+        fi
         echo -e "${green}==================================================${plain}"
     fi
     echo ""
@@ -250,7 +286,7 @@ After=network.target
 Wants=network.target
 
 [Service]
-EnvironmentFile=-/etc/default/x-ui
+EnvironmentFile=/etc/default/x-ui
 Environment="XRAY_VMESS_AEAD_FORCED=false"
 Type=simple
 WorkingDirectory=${INSTALL_DIR}/
@@ -319,6 +355,7 @@ install_program_files
 
 is_zh && step 4 5 "配置面板账号、端口和安全后缀" || step 4 5 "Configuring panel login, port and secure suffix"
 init_panel_settings
+configure_http_exposure
 is_zh && step 5 5 "安装并启动系统服务" || step 5 5 "Installing and starting system service"
 install_service
 print_install_guide
