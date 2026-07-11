@@ -358,8 +358,11 @@
             },
             applySimpleInbound(type) {
                 this.simpleInboundType = type;
-                const port = type === "vless-reality" ? 443 :
-                    (type === "vless-ws" ? 2053 : (this.inbound.port || RandomUtil.randomInteger(10000, 60000)));
+                const port = type === "vless-reality"
+                    ? this.preferredAvailableInboundPort([443, 8443, 2053, 2083, 2087, 2096])
+                    : (type === "vless-ws"
+                        ? this.preferredAvailableInboundPort([2053, 443, 8443, 2083, 2087, 2096])
+                        : (this.inbound.port || this.chooseAvailableInboundPort([], true)));
                 inModal.inbound = new Inbound(port);
 
                 if (type === "vless-reality") {
@@ -384,18 +387,40 @@
 
                 inModal.inbound.protocol = Protocols.MIXED;
             },
+            availableInboundPorts(candidates) {
+                const reservedPorts = new Set(Array.isArray(app.reservedInboundPorts) ? app.reservedInboundPorts : []);
+                return candidates.filter(port => !reservedPorts.has(port));
+            },
+            preferredAvailableInboundPort(candidates) {
+                const available = this.availableInboundPorts(candidates);
+                return (available.length > 0 ? available : candidates)[0];
+            },
+            chooseAvailableInboundPort(candidates, useRandomRange = false) {
+                const reservedPorts = new Set(Array.isArray(app.reservedInboundPorts) ? app.reservedInboundPorts : []);
+                if (!useRandomRange) {
+                    const available = this.availableInboundPorts(candidates);
+                    const ports = available.length > 0 ? available : candidates;
+                    return ports[RandomUtil.randomInteger(0, ports.length - 1)];
+                }
+
+                let port;
+                do {
+                    port = RandomUtil.randomInteger(10000, 60000);
+                } while (reservedPorts.has(port));
+                return port;
+            },
             randomPort() {
                 if (this.simpleInboundType === "vless-reality") {
                     const ports = [443, 8443, 2053, 2083, 2087, 2096];
-                    this.inbound.port = ports[RandomUtil.randomInteger(0, ports.length - 1)];
+                    this.inbound.port = this.chooseAvailableInboundPort(ports);
                     return;
                 }
                 if (this.simpleInboundType === "vless-ws") {
                     const ports = [443, 2053, 2083, 2087, 2096, 8443];
-                    this.inbound.port = ports[RandomUtil.randomInteger(0, ports.length - 1)];
+                    this.inbound.port = this.chooseAvailableInboundPort(ports);
                     return;
                 }
-                this.inbound.port = RandomUtil.randomInteger(10000, 60000);
+                this.inbound.port = this.chooseAvailableInboundPort([], true);
             },
             simpleWsCertReady() {
                 const cert = this.inbound.stream.tls.certs[0];

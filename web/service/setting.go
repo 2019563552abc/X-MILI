@@ -341,6 +341,13 @@ func (s *SettingService) GetListen() (string, error) {
 }
 
 func (s *SettingService) SetListen(ip string) error {
+	port, err := s.GetPort()
+	if err != nil {
+		return err
+	}
+	if err := s.validatePanelListenerChange(ip, port); err != nil {
+		return err
+	}
 	return s.setString("webListen", ip)
 }
 
@@ -369,7 +376,31 @@ func (s *SettingService) GetPort() (int, error) {
 }
 
 func (s *SettingService) SetPort(port int) error {
+	listen, err := s.GetListen()
+	if err != nil {
+		return err
+	}
+	if err := s.validatePanelListenerChange(listen, port); err != nil {
+		return err
+	}
 	return s.setInt("webPort", port)
+}
+
+func (s *SettingService) validatePanelListenerChange(listen string, port int) error {
+	if listen != "" && net.ParseIP(listen) == nil {
+		return common.NewError("web listen is not valid ip:", listen)
+	}
+	if port <= 0 || port > 65535 {
+		return common.NewError("web port is not a valid port:", port)
+	}
+
+	settings, err := s.GetAllSetting()
+	if err != nil {
+		return err
+	}
+	settings.WebListen = listen
+	settings.WebPort = port
+	return validateSettingsAgainstCurrentInbounds(settings)
 }
 
 func (s *SettingService) SetCertFile(webCertFile string) error {
@@ -641,6 +672,9 @@ func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
 	if err := allSetting.CheckValid(); err != nil {
 		return err
 	}
+	if err := validateSettingsAgainstCurrentInbounds(allSetting); err != nil {
+		return err
+	}
 
 	v := reflect.ValueOf(allSetting).Elem()
 	t := reflect.TypeFor[entity.AllSetting]()
@@ -695,6 +729,8 @@ func (s *SettingService) GetDefaultSettings(host string) (any, error) {
 		"expireDiff":     func() (any, error) { return s.GetExpireDiff() },
 		"trafficDiff":    func() (any, error) { return s.GetTrafficDiff() },
 		"pageSize":       func() (any, error) { return s.GetPageSize() },
+		"webPort":        func() (any, error) { return s.GetPort() },
+		"subPort":        func() (any, error) { return s.GetSubPort() },
 		"defaultCert":    func() (any, error) { return s.GetCertFile() },
 		"defaultKey":     func() (any, error) { return s.GetKeyFile() },
 		"subEnable":      func() (any, error) { return s.GetSubEnable() },

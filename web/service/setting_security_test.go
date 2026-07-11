@@ -52,6 +52,25 @@ func TestFreshSettingsUseSafePanelAndSubscriptionDefaults(t *testing.T) {
 	}
 }
 
+func TestDefaultSettingsIncludePanelAndSubscriptionPorts(t *testing.T) {
+	setupSecuritySettingsDB(t)
+
+	value, err := (&SettingService{}).GetDefaultSettings("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("default settings type = %T, want map[string]any", value)
+	}
+	for key, want := range map[string]int{"webPort": 2053, "subPort": 2096} {
+		got, ok := settings[key].(int)
+		if !ok || got != want {
+			t.Fatalf("%s = %#v, want %d", key, settings[key], want)
+		}
+	}
+}
+
 func TestUpdateFirstUserCompletesBootstrap(t *testing.T) {
 	setupSecuritySettingsDB(t)
 	users := &UserService{}

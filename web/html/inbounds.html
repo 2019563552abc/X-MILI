@@ -1045,6 +1045,9 @@
       trafficDiff: 0,
       defaultCert: '',
       defaultKey: '',
+      reservedInboundPorts: [Number(window.location.port)].filter(
+        port => Number.isInteger(port) && port >= 1 && port <= 65535
+      ),
       clientCount: {},
       onlineClients: [],
       lastOnlineMap: {},
@@ -1172,6 +1175,10 @@
         this.trafficDiff = settings.trafficDiff * 1073741824;
         this.defaultCert = settings.defaultCert;
         this.defaultKey = settings.defaultKey;
+        this.reservedInboundPorts = [
+          Number(settings.webPort),
+          ...(settings.subEnable ? [Number(settings.subPort)] : []),
+        ].filter(port => Number.isInteger(port) && port >= 1 && port <= 65535);
         this.subSettings = {
           enable: settings.subEnable,
           subTitle: settings.subTitle,

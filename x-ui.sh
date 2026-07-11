@@ -554,14 +554,57 @@ restart() {
     return "$restart_rc"
 }
 
+xray_pid_snapshot() {
+    local destination="$1" snapshot
+    snapshot=$(ps -eo pid=,args= 2> /dev/null \
+        | awk '$0 ~ /xray-linux/ && $0 ~ /(^|[[:space:]])-c[[:space:]]+([^[:space:]]*\/)?config\.json([[:space:]]|$)/ {printf "%s ", $1}')
+    printf -v "$destination" '%s' "$snapshot"
+}
+
 restart_xray() {
-    systemctl reload x-ui
-    LOGI "xray-core Restart signal sent successfully, Please check the log information to confirm whether xray restarted successfully"
-    sleep 2
-    show_xray_status
+    local restart_rc=1 attempt current_pids candidate_pids="" old_pid
+    local old_still_running
+    local old_pids="" max_attempts=8
+
+    xray_pid_snapshot old_pids
+    if systemctl reload x-ui; then
+        # Reload is asynchronous. Do not accept the old child that may still be
+        # alive immediately after the signal. A replacement PID must remain
+        # healthy for two consecutive checks within the eight-second window.
+        for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            sleep 1
+            current_pids=""
+            if check_xray_status; then
+                xray_pid_snapshot current_pids
+                old_still_running=0
+                for old_pid in $old_pids; do
+                    if [[ " $current_pids" == *" $old_pid "* ]]; then
+                        old_still_running=1
+                        break
+                    fi
+                done
+                if [[ -n "$current_pids" && $old_still_running -eq 0 ]]; then
+                    if [[ "$current_pids" == "$candidate_pids" ]]; then
+                        restart_rc=0
+                        break
+                    fi
+                    candidate_pids="$current_pids"
+                    continue
+                fi
+            fi
+            candidate_pids=""
+        done
+    fi
+
+    if [[ $restart_rc -eq 0 ]]; then
+        LOGI "xray-core restarted successfully"
+    else
+        LOGE "xray-core restart failed. Inspect the service logs with: journalctl -u x-ui -e --no-pager"
+    fi
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
+    return "$restart_rc"
 }
 
 status() {
@@ -914,6 +957,95 @@ show_xray_status() {
     fi
 }
 
+firewall_require_ufw() {
+    if command -v ufw > /dev/null 2>&1; then
+        return 0
+    fi
+
+    if is_zh; then
+        LOGE "未安装 UFW。请先选择 1 安装防火墙。"
+    else
+        LOGE "UFW is not installed. Select option 1 to install the firewall first."
+    fi
+    return 1
+}
+
+firewall_current_ssh_server_port() {
+    local client_address client_port server_address server_port extra port_number
+    IFS=' ' read -r client_address client_port server_address server_port extra \
+        <<< "${SSH_CONNECTION:-}" || return 1
+    [[ -n "$client_address" && -n "$client_port" && -n "$server_address" \
+        && -z "$extra" && "$server_port" =~ ^[0-9]{1,5}$ ]] || return 1
+    port_number=$((10#$server_port))
+    ((port_number >= 1 && port_number <= 65535)) || return 1
+    printf '%d\n' "$port_number"
+}
+
+firewall_list_rules() {
+    firewall_require_ufw || return 1
+    LC_ALL=C ufw status numbered
+}
+
+firewall_status() {
+    firewall_require_ufw || return 1
+    LC_ALL=C ufw status verbose
+}
+
+firewall_enable() {
+    local ssh_port status confirmation
+    firewall_require_ufw || return 1
+    if ! ssh_port=$(firewall_current_ssh_server_port); then
+        if is_zh; then
+            LOGE "无法从 SSH_CONNECTION 检测并验证当前 SSH 服务端口；为避免断开远程连接，未启用防火墙。"
+        else
+            LOGE "Could not detect and validate the active SSH server port from SSH_CONNECTION; the firewall was not enabled."
+        fi
+        return 1
+    fi
+
+    if ! status=$(LC_ALL=C ufw status 2> /dev/null); then
+        is_zh && LOGE "无法读取 UFW 状态。" || LOGE "Failed to read UFW status."
+        return 1
+    fi
+    if grep -Eq '^Status:[[:space:]]*active[[:space:]]*$' <<< "$status"; then
+        is_zh && echo "防火墙已启用。" || echo "Firewall is already active."
+        return 0
+    fi
+
+    firewall_list_rules || return 1
+    if is_zh; then
+        echo "将自动放行当前 SSH 服务端口 ${ssh_port}/tcp，并完整保留现有 UFW 规则。"
+        echo "脚本不会猜测面板、订阅或 Xray 入站端口；请确认上方规则已包含所有需要公网访问的端口。"
+        read -rp "确认规则完整并继续启用？[y/N]: " confirmation
+    else
+        echo "The active SSH server port ${ssh_port}/tcp will be allowed and all existing UFW rules will be preserved."
+        echo "Panel, subscription, and Xray inbound ports are not guessed; verify that every required public port appears above."
+        read -rp "Are the rules complete, and should UFW be enabled? [y/N]: " confirmation
+    fi
+    case "$confirmation" in
+        y|Y|yes|YES) ;;
+        *)
+            is_zh && echo "已取消，防火墙未启用。" || echo "Cancelled; the firewall was not enabled."
+            return 1
+            ;;
+    esac
+
+    if ! ufw allow "${ssh_port}/tcp"; then
+        is_zh && LOGE "当前 SSH 端口放行失败，未启用防火墙。" \
+            || LOGE "Failed to allow the active SSH port; the firewall was not enabled."
+        return 1
+    fi
+    if ! ufw --force enable; then
+        is_zh && LOGE "防火墙启用失败。" || LOGE "Failed to enable the firewall."
+        return 1
+    fi
+}
+
+firewall_disable() {
+    firewall_require_ufw || return 1
+    ufw disable
+}
+
 firewall_menu() {
     if is_zh; then
         echo -e "${green}\t1.${plain} ${green}安装${plain}防火墙"
@@ -945,7 +1077,7 @@ firewall_menu() {
             firewall_menu
             ;;
         2)
-            ufw status numbered
+            firewall_list_rules
             firewall_menu
             ;;
         3)
@@ -957,15 +1089,15 @@ firewall_menu() {
             firewall_menu
             ;;
         5)
-            ufw enable
+            firewall_enable
             firewall_menu
             ;;
         6)
-            ufw disable
+            firewall_disable
             firewall_menu
             ;;
         7)
-            ufw status verbose
+            firewall_status
             firewall_menu
             ;;
         *)
@@ -976,39 +1108,50 @@ firewall_menu() {
 }
 
 install_firewall() {
-    if ! command -v ufw &> /dev/null; then
-        echo "ufw firewall is not installed. Installing now..."
-        apt-get update
-        apt-get install -y ufw
-    else
-        echo "ufw firewall is already installed"
+    if command -v ufw > /dev/null 2>&1; then
+        is_zh && echo "UFW 已安装。" || echo "UFW is already installed."
+        return 0
     fi
 
-    # Check if the firewall is inactive
-    if ufw status | grep -q "Status: active"; then
-        echo "Firewall is already active"
-    else
-        echo "Activating firewall..."
-        # Open the necessary ports
-        ufw allow ssh
-        ufw allow http
-        ufw allow https
-        ufw allow 2053/tcp #webPort
-        ufw allow 2096/tcp #subport
+    if ! command -v apt-get > /dev/null 2>&1; then
+        if is_zh; then
+            LOGE "安装 UFW 需要 apt-get；当前系统未检测到受支持的包管理器。"
+        else
+            LOGE "apt-get is required to install UFW; no supported package manager was found."
+        fi
+        return 1
+    fi
 
-        # Enable the firewall
-        ufw --force enable
+    is_zh && echo "未安装 UFW，正在安装..." \
+        || echo "UFW is not installed. Installing now..."
+    if ! apt-get update || ! apt-get install -y ufw; then
+        if is_zh; then
+            LOGE "UFW 安装失败，未修改防火墙规则。"
+        else
+            LOGE "Failed to install UFW; firewall rules were not changed."
+        fi
+        return 1
+    fi
+    hash -r
+    firewall_require_ufw || return 1
+
+    if is_zh; then
+        echo "UFW 安装完成但尚未启用。请先开放当前 SSH 和所需服务端口，再选择 5 启用防火墙。"
+    else
+        echo "UFW is installed but not enabled. Open the active SSH and service ports before selecting option 5."
     fi
 }
 
 open_ports() {
+    firewall_require_ufw || return 1
+
     # Prompt the user to enter the ports they want to open
     read -rp "Enter the ports you want to open (e.g. 80,443,2053 or range 400-500): " ports
 
     # Check if the input is valid
     if ! [[ $ports =~ ^([0-9]+|[0-9]+-[0-9]+)(,([0-9]+|[0-9]+-[0-9]+))*$ ]]; then
         echo "Error: Invalid input. Please enter a comma-separated list of ports or a range of ports (e.g. 80,443,2053 or 400-500)." >&2
-        exit 1
+        return 1
     fi
 
     # Open the specified ports using ufw
@@ -1016,11 +1159,11 @@ open_ports() {
     for port in "${PORT_LIST[@]}"; do
         if [[ $port == *-* ]]; then
             # Split the range into start and end ports
-            start_port=$(echo $port | cut -d'-' -f1)
-            end_port=$(echo $port | cut -d'-' -f2)
+            start_port=${port%%-*}
+            end_port=${port##*-}
             # Open the port range
-            ufw allow $start_port:$end_port/tcp
-            ufw allow $start_port:$end_port/udp
+            ufw allow "${start_port}:${end_port}/tcp"
+            ufw allow "${start_port}:${end_port}/udp"
         else
             # Open the single port
             ufw allow "$port"
@@ -1031,8 +1174,8 @@ open_ports() {
     echo "Opened the specified ports:"
     for port in "${PORT_LIST[@]}"; do
         if [[ $port == *-* ]]; then
-            start_port=$(echo $port | cut -d'-' -f1)
-            end_port=$(echo $port | cut -d'-' -f2)
+            start_port=${port%%-*}
+            end_port=${port##*-}
             # Check if the port range has been successfully opened
             (ufw status | grep -q "$start_port:$end_port") && echo "$start_port-$end_port"
         else
@@ -1043,6 +1186,8 @@ open_ports() {
 }
 
 delete_ports() {
+    firewall_require_ufw || return 1
+
     # Display current rules with numbers
     echo "Current UFW rules:"
     ufw status numbered
@@ -1060,7 +1205,7 @@ delete_ports() {
         # Validate the input
         if ! [[ $rule_numbers =~ ^([0-9]+)(,[0-9]+)*$ ]]; then
             echo "Error: Invalid input. Please enter a comma-separated list of rule numbers." >&2
-            exit 1
+            return 1
         fi
 
         # Split numbers into an array
@@ -1079,7 +1224,7 @@ delete_ports() {
         # Validate the input
         if ! [[ $ports =~ ^([0-9]+|[0-9]+-[0-9]+)(,([0-9]+|[0-9]+-[0-9]+))*$ ]]; then
             echo "Error: Invalid input. Please enter a comma-separated list of ports or a range of ports (e.g. 80,443,2053 or 400-500)." >&2
-            exit 1
+            return 1
         fi
 
         # Split ports into an array
@@ -1087,11 +1232,11 @@ delete_ports() {
         for port in "${PORT_LIST[@]}"; do
             if [[ $port == *-* ]]; then
                 # Split the port range
-                start_port=$(echo $port | cut -d'-' -f1)
-                end_port=$(echo $port | cut -d'-' -f2)
+                start_port=${port%%-*}
+                end_port=${port##*-}
                 # Delete the port range
-                ufw delete allow $start_port:$end_port/tcp
-                ufw delete allow $start_port:$end_port/udp
+                ufw delete allow "${start_port}:${end_port}/tcp"
+                ufw delete allow "${start_port}:${end_port}/udp"
             else
                 # Delete a single port
                 ufw delete allow "$port"
@@ -1102,8 +1247,8 @@ delete_ports() {
         echo "Deleted the specified ports:"
         for port in "${PORT_LIST[@]}"; do
             if [[ $port == *-* ]]; then
-                start_port=$(echo $port | cut -d'-' -f1)
-                end_port=$(echo $port | cut -d'-' -f2)
+                start_port=${port%%-*}
+                end_port=${port##*-}
                 # Check if the port range has been deleted
                 (ufw status | grep -q "$start_port:$end_port") || echo "$start_port-$end_port"
             else
@@ -1113,7 +1258,7 @@ delete_ports() {
         done
     else
         echo "${red}Error:${plain} Invalid choice. Please enter 1 or 2." >&2
-        exit 1
+        return 1
     fi
 }
 

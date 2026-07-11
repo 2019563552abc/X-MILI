@@ -218,6 +218,13 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		inboundConfig := inbound.GenXrayInboundConfig()
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
 	}
+	settings, err := s.settingService.GetAllSetting()
+	if err != nil {
+		return nil, err
+	}
+	if err := validateXrayConfigListenerPortConflicts(settings, xrayConfig); err != nil {
+		return nil, err
+	}
 	return xrayConfig, nil
 }
 

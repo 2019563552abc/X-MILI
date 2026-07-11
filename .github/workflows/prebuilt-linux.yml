@@ -28,8 +28,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc libc6-dev shellcheck
-          bash -n deploy.sh install.sh install-docker.sh update.sh x-ui.sh DockerEntrypoint.sh DockerInit.sh
-          shellcheck --severity=error deploy.sh install.sh install-docker.sh update.sh x-ui.sh DockerEntrypoint.sh DockerInit.sh
+          bash -n deploy.sh install.sh install-docker.sh update.sh x-ui.sh DockerEntrypoint.sh DockerInit.sh tests/firewall_menu_test.sh tests/restart_xray_test.sh
+          bash tests/firewall_menu_test.sh
+          bash tests/restart_xray_test.sh
+          node tests/inbound_reserved_ports_test.js
+          shellcheck --severity=error deploy.sh install.sh install-docker.sh update.sh x-ui.sh DockerEntrypoint.sh DockerInit.sh tests/firewall_menu_test.sh tests/restart_xray_test.sh
           go test ./...
           go vet ./...
 
