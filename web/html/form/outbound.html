@@ -5,13 +5,14 @@
   <a-tab-pane key="1" tab="Form">
     <a-form :colon="false" :label-col="{ md: {span:8} }" :wrapper-col="{ md: {span:14} }">
       <a-form-item label='{{ i18n "protocol" }}'>
-        <a-select v-model="outbound.protocol" :dropdown-class-name="themeSwitcher.currentTheme">
+        <a-select v-model="outbound.protocol" @change="outModal.check()"
+          :dropdown-class-name="themeSwitcher.currentTheme">
           <a-select-option v-for="x,y in Protocols" :value="x">[[ y ]]</a-select-option>
         </a-select>
       </a-form-item>
       <a-form-item label='{{ i18n "pages.xray.outbound.tag" }}' has-feedback
         :validate-status="outModal.duplicateTag? 'warning' : 'success'">
-        <a-input v-model.trim="outbound.tag" @change="outModal.check()"
+        <a-input v-model.trim="outbound.tag" @input="outModal.check()"
           placeholder='{{ i18n "pages.xray.outbound.tagDesc" }}'></a-input>
       </a-form-item>
       <a-form-item label='{{ i18n "pages.xray.outbound.sendThrough" }}'>
@@ -314,18 +315,24 @@
 
       <!-- Address + Port -->
       <template v-if="outbound.hasAddressPort()">
-        <a-form-item label='{{ i18n "pages.inbounds.address" }}'>
-          <a-input v-model.trim="outbound.settings.address"></a-input>
+        <a-form-item label='{{ i18n "pages.inbounds.address" }}'
+          :validate-status="outModal.fieldError('address') ? 'error' : ''"
+          :help="outModal.fieldError('address')">
+          <a-input v-model.trim="outbound.settings.address" @input="outModal.check()"></a-input>
         </a-form-item>
-        <a-form-item label='{{ i18n "pages.inbounds.port" }}'>
-          <a-input-number v-model.number="outbound.settings.port" :min="1" :max="65532"></a-input-number>
+        <a-form-item label='{{ i18n "pages.inbounds.port" }}'
+          :validate-status="outModal.fieldError('port') ? 'error' : ''"
+          :help="outModal.fieldError('port')">
+          <a-input-number v-model.number="outbound.settings.port" :min="1" :max="65535"
+            @change="outModal.check()"></a-input-number>
         </a-form-item>
       </template>
 
       <!-- VLESS/VMess user settings -->
       <template v-if="[Protocols.VMess, Protocols.VLESS].includes(outbound.protocol)">
-        <a-form-item label="ID">
-          <a-input v-model.trim="outbound.settings.id"></a-input>
+        <a-form-item label="ID" :validate-status="outModal.fieldError('id') ? 'error' : ''"
+          :help="outModal.fieldError('id')">
+          <a-input v-model.trim="outbound.settings.id" @input="outModal.check()"></a-input>
         </a-form-item>
 
         <!-- vmess settings -->
@@ -339,8 +346,9 @@
 
         <!-- vless settings -->
         <template v-if="outbound.protocol === Protocols.VLESS">
-          <a-form-item label="encryption">
-            <a-input v-model.trim="outbound.settings.encryption"></a-input>
+          <a-form-item label="encryption" :validate-status="outModal.fieldError('encryption') ? 'error' : ''"
+            :help="outModal.fieldError('encryption')">
+            <a-input v-model.trim="outbound.settings.encryption" @input="outModal.check()"></a-input>
           </a-form-item>
           <a-form-item>
             <template slot="label">

@@ -36,7 +36,14 @@ func (s *XraySettingService) CheckXrayConfig(XrayTemplateConfig string) error {
 	if err != nil {
 		return common.NewError("xray template config invalid:", err)
 	}
-	return nil
+
+	var outbounds []any
+	if len(xrayConfig.OutboundConfigs) > 0 && string(xrayConfig.OutboundConfigs) != "null" {
+		if err := decodeJSONUseNumber(xrayConfig.OutboundConfigs, &outbounds); err != nil {
+			return common.NewError("xray template outbounds invalid:", err)
+		}
+	}
+	return validateVLESSOutbounds(outbounds)
 }
 
 // UnwrapXrayTemplateConfig returns the raw xray config JSON from `raw`,

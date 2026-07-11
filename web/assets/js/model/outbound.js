@@ -1148,11 +1148,24 @@ class Outbound extends CommonClass {
         return [Protocols.Socks, Protocols.HTTP].includes(this.protocol);
     }
 
+    validationIssues() {
+        if (this.protocol === Protocols.VLESS && this.settings instanceof Outbound.VLESSSettings) {
+            return this.settings.validationIssues();
+        }
+        return [];
+    }
+
     static fromJson(json = {}) {
+        if (json === null || typeof json !== 'object' || Array.isArray(json)) json = {};
+        const jsonSettings = json.settings !== null
+            && typeof json.settings === 'object'
+            && !Array.isArray(json.settings)
+            ? json.settings
+            : {};
         return new Outbound(
             json.tag,
             json.protocol,
-            Outbound.Settings.fromJson(json.protocol, json.settings),
+            Outbound.Settings.fromJson(json.protocol, jsonSettings),
             StreamSettings.fromJson(json.streamSettings),
             json.sendThrough,
             Mux.fromJson(json.mux),
@@ -1747,7 +1760,18 @@ Outbound.VmessSettings = class extends CommonClass {
     }
 };
 Outbound.VLESSSettings = class extends CommonClass {
-    constructor(address, port, id, flow, encryption, reverseTag = '', testpre = 0, testseed = [900, 500, 900, 256]) {
+    constructor(
+        address,
+        port,
+        id,
+        flow,
+        encryption = 'none',
+        reverseTag = '',
+        testpre = 0,
+        testseed = [900, 500, 900, 256],
+        legacyJson = null,
+        legacyReadOnlyReason = '',
+    ) {
         super();
         this.address = address;
         this.port = port;
@@ -1757,10 +1781,67 @@ Outbound.VLESSSettings = class extends CommonClass {
         this.reverseTag = reverseTag;
         this.testpre = testpre;
         this.testseed = testseed;
+        this.legacyJson = legacyJson;
+        this.legacyReadOnlyReason = legacyReadOnlyReason;
     }
 
     static fromJson(json = {}) {
-        if (ObjectUtil.isEmpty(json.address) || ObjectUtil.isEmpty(json.port)) return new Outbound.VLESSSettings();
+        if (Object.prototype.hasOwnProperty.call(json, 'vnext')) {
+            const legacyJson = JSON.parse(JSON.stringify(json));
+            const endpoints = Array.isArray(json.vnext) ? json.vnext : [];
+            const endpoint = endpoints.length === 1 && endpoints[0] ? endpoints[0] : {};
+            const users = Array.isArray(endpoint.users) ? endpoint.users : [];
+            const mixedFlatFields = ['address', 'port', 'id', 'flow', 'encryption']
+                .filter(field => Object.prototype.hasOwnProperty.call(json, field));
+
+            if (mixedFlatFields.length > 0) {
+                const reason = `VLESS settings mix legacy vnext with flat field(s): ${mixedFlatFields.join(', ')}. This ambiguous configuration is read-only; remove one representation before editing.`;
+                return new Outbound.VLESSSettings(
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    '',
+                    0,
+                    [900, 500, 900, 256],
+                    legacyJson,
+                    reason,
+                );
+            }
+
+            if (endpoints.length !== 1 || users.length !== 1) {
+                const reason = `Legacy VLESS requires exactly one vnext endpoint and one user; found ${endpoints.length} endpoint(s) and ${users.length} user(s). Split it into separate outbounds before editing.`;
+                return new Outbound.VLESSSettings(
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    undefined,
+                    '',
+                    0,
+                    [900, 500, 900, 256],
+                    legacyJson,
+                    reason,
+                );
+            }
+
+            const user = users[0] || {};
+            return new Outbound.VLESSSettings(
+                endpoint.address,
+                endpoint.port,
+                user.id,
+                user.flow,
+                user.encryption,
+                json.reverse?.tag || '',
+                user.testpre || json.testpre || 0,
+                user.testseed && user.testseed.length >= 4
+                    ? user.testseed
+                    : (json.testseed && json.testseed.length >= 4 ? json.testseed : [900, 500, 900, 256]),
+                legacyJson,
+            );
+        }
+
         return new Outbound.VLESSSettings(
             json.address,
             json.port,
@@ -1773,7 +1854,72 @@ Outbound.VLESSSettings = class extends CommonClass {
         );
     }
 
+    validationIssues() {
+        if (!ObjectUtil.isEmpty(this.legacyReadOnlyReason)) {
+            return [{ field: 'legacy', message: this.legacyReadOnlyReason }];
+        }
+
+        const issues = [];
+        if (ObjectUtil.isEmpty(this.address) || this.address.toString().trim() === '') {
+            issues.push({ field: 'address', message: 'VLESS address is required.' });
+        }
+
+        if (typeof this.port !== 'number' || !Number.isInteger(this.port) || this.port < 1 || this.port > 65535) {
+            issues.push({ field: 'port', message: 'VLESS port must be between 1 and 65535.' });
+        }
+
+        if (ObjectUtil.isEmpty(this.id) || this.id.toString().trim() === '') {
+            issues.push({ field: 'id', message: 'VLESS user ID is required.' });
+        }
+        if (typeof this.encryption !== 'string' || this.encryption.trim() === '') {
+            issues.push({ field: 'encryption', message: 'VLESS encryption is required (usually "none").' });
+        }
+        return issues;
+    }
+
     toJson() {
+        if (this.legacyJson) {
+            const result = JSON.parse(JSON.stringify(this.legacyJson));
+            if (!ObjectUtil.isEmpty(this.legacyReadOnlyReason)) return result;
+
+            const endpoint = result.vnext[0];
+            const user = endpoint.users[0];
+            endpoint.address = this.address;
+            endpoint.port = this.port;
+            user.id = this.id;
+            user.flow = this.flow;
+            user.encryption = this.encryption;
+
+            if (!ObjectUtil.isEmpty(this.reverseTag)) {
+                result.reverse = { ...(result.reverse || {}), tag: this.reverseTag };
+            } else if (result.reverse && typeof result.reverse === 'object') {
+                delete result.reverse.tag;
+                if (Object.keys(result.reverse).length === 0) delete result.reverse;
+            }
+
+            const visionOnUser = Object.prototype.hasOwnProperty.call(user, 'testpre')
+                || Object.prototype.hasOwnProperty.call(user, 'testseed')
+                || (!Object.prototype.hasOwnProperty.call(result, 'testpre')
+                    && !Object.prototype.hasOwnProperty.call(result, 'testseed'));
+            const visionTarget = visionOnUser ? user : result;
+            if (this.flow && this.flow !== '') {
+                if (this.testpre > 0) {
+                    visionTarget.testpre = this.testpre;
+                } else {
+                    delete visionTarget.testpre;
+                }
+                if (this.testseed && this.testseed.length >= 4) {
+                    visionTarget.testseed = this.testseed;
+                } else {
+                    delete visionTarget.testseed;
+                }
+            } else {
+                delete visionTarget.testpre;
+                delete visionTarget.testseed;
+            }
+            return result;
+        }
+
         const result = {
             address: this.address,
             port: this.port,

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -127,8 +128,8 @@ type TestOutboundResult struct {
 }
 
 // TestOutbound tests an outbound by creating a temporary xray instance and measuring response time.
-// allOutboundsJSON must be a JSON array of all outbounds; they are copied into the test config unchanged.
-// Only the test inbound and a route rule (to the tested outbound tag) are added.
+// allOutboundsJSON is used to resolve explicit outbound dependencies. The temporary
+// config includes only the tested outbound and its dependency closure.
 func (s *OutboundService) TestOutbound(outboundJSON string, testURL string, allOutboundsJSON string) (*TestOutboundResult, error) {
 	if testURL == "" {
 		testURL = DefaultXrayOutboundTestURL
@@ -145,7 +146,7 @@ func (s *OutboundService) TestOutbound(outboundJSON string, testURL string, allO
 
 	// Parse the outbound being tested to get its tag
 	var testOutbound map[string]any
-	if err := json.Unmarshal([]byte(outboundJSON), &testOutbound); err != nil {
+	if err := decodeJSONUseNumber([]byte(outboundJSON), &testOutbound); err != nil {
 		return &TestOutboundResult{
 			Success: false,
 			Error:   fmt.Sprintf("Invalid outbound JSON: %v", err),
@@ -165,18 +166,29 @@ func (s *OutboundService) TestOutbound(outboundJSON string, testURL string, allO
 		}, nil
 	}
 
-	// Use all outbounds when provided; otherwise fall back to single outbound
+	// Use the posted list only as a dependency catalog. Unrelated outbounds must
+	// not make an otherwise independent outbound test fail.
 	var allOutbounds []any
 	if allOutboundsJSON != "" {
-		if err := json.Unmarshal([]byte(allOutboundsJSON), &allOutbounds); err != nil {
+		if err := decodeJSONUseNumber([]byte(allOutboundsJSON), &allOutbounds); err != nil {
 			return &TestOutboundResult{
 				Success: false,
 				Error:   fmt.Sprintf("Invalid allOutbounds JSON: %v", err),
 			}, nil
 		}
 	}
-	if len(allOutbounds) == 0 {
-		allOutbounds = []any{testOutbound}
+	selectedOutbounds, err := selectOutboundTestClosure(testOutbound, allOutbounds)
+	if err != nil {
+		return &TestOutboundResult{
+			Success: false,
+			Error:   fmt.Sprintf("Invalid outbound dependency graph: %v", err),
+		}, nil
+	}
+	if err := validateVLESSOutbounds(selectedOutbounds); err != nil {
+		return &TestOutboundResult{
+			Success: false,
+			Error:   fmt.Sprintf("Invalid outbound configuration: %v", err),
+		}, nil
 	}
 
 	// Find an available port for test inbound
@@ -188,8 +200,8 @@ func (s *OutboundService) TestOutbound(outboundJSON string, testURL string, allO
 		}, nil
 	}
 
-	// Copy all outbounds as-is, add only test inbound and route rule
-	testConfig := s.createTestConfig(outboundTag, allOutbounds, testPort)
+	// Copy the selected dependency closure as-is, then add the test inbound and route rule.
+	testConfig := s.createTestConfig(outboundTag, selectedOutbounds, testPort)
 
 	// Use a temporary config file so the main config.json is never overwritten
 	testConfigPath, err := createTestConfigPath()
@@ -257,9 +269,114 @@ func (s *OutboundService) TestOutbound(outboundJSON string, testURL string, allO
 	}, nil
 }
 
-// createTestConfig creates a test config by copying all outbounds unchanged and adding
-// only the test inbound (SOCKS) and a route rule that sends traffic to the given outbound tag.
-func (s *OutboundService) createTestConfig(outboundTag string, allOutbounds []any, testPort int) *xray.Config {
+// selectOutboundTestClosure returns the tested outbound plus every outbound it
+// explicitly depends on through sockopt.dialerProxy or proxySettings.tag.
+// The tested object is authoritative even when allOutbounds contains an older
+// object with the same tag.
+func selectOutboundTestClosure(testOutbound map[string]any, allOutbounds []any) ([]any, error) {
+	rootTag, _ := testOutbound["tag"].(string)
+	if strings.TrimSpace(rootTag) == "" {
+		return nil, fmt.Errorf("tested outbound has no tag")
+	}
+
+	catalog := make(map[string]map[string]any)
+	duplicates := make(map[string]bool)
+	for _, rawOutbound := range allOutbounds {
+		outbound, ok := rawOutbound.(map[string]any)
+		if !ok {
+			continue
+		}
+		tag, _ := outbound["tag"].(string)
+		if strings.TrimSpace(tag) == "" || tag == rootTag {
+			continue
+		}
+		if _, exists := catalog[tag]; exists {
+			duplicates[tag] = true
+			continue
+		}
+		catalog[tag] = outbound
+	}
+
+	selected := make([]any, 0, len(catalog)+1)
+	state := make(map[string]uint8)
+	var visit func(string, map[string]any) error
+	visit = func(tag string, outbound map[string]any) error {
+		switch state[tag] {
+		case 1:
+			return fmt.Errorf("outbound dependency cycle detected at tag %q", tag)
+		case 2:
+			return nil
+		}
+
+		state[tag] = 1
+		selected = append(selected, outbound)
+		dependencies, err := outboundDependencyTags(tag, outbound)
+		if err != nil {
+			return err
+		}
+		for _, dependencyTag := range dependencies {
+			if state[dependencyTag] == 1 {
+				return fmt.Errorf("outbound dependency cycle detected from tag %q to tag %q", tag, dependencyTag)
+			}
+			if duplicates[dependencyTag] {
+				return fmt.Errorf("outbound tag %q has duplicate dependency tag %q", tag, dependencyTag)
+			}
+
+			var dependency map[string]any
+			if dependencyTag == rootTag {
+				dependency = testOutbound
+			} else {
+				dependency = catalog[dependencyTag]
+			}
+			if dependency == nil {
+				return fmt.Errorf("outbound tag %q has missing dependency %q", tag, dependencyTag)
+			}
+			if err := visit(dependencyTag, dependency); err != nil {
+				return err
+			}
+		}
+		state[tag] = 2
+		return nil
+	}
+
+	if err := visit(rootTag, testOutbound); err != nil {
+		return nil, err
+	}
+	return selected, nil
+}
+
+func outboundDependencyTags(outboundTag string, outbound map[string]any) ([]string, error) {
+	dependencies := make([]string, 0, 2)
+	if streamSettings, ok := outbound["streamSettings"].(map[string]any); ok {
+		if sockopt, ok := streamSettings["sockopt"].(map[string]any); ok {
+			if rawTag, exists := sockopt["dialerProxy"]; exists {
+				tag, ok := rawTag.(string)
+				if !ok {
+					return nil, fmt.Errorf("outbound tag %q has non-string streamSettings.sockopt.dialerProxy", outboundTag)
+				}
+				if strings.TrimSpace(tag) != "" {
+					dependencies = append(dependencies, tag)
+				}
+			}
+		}
+	}
+	if proxySettings, ok := outbound["proxySettings"].(map[string]any); ok {
+		if rawTag, exists := proxySettings["tag"]; exists {
+			tag, ok := rawTag.(string)
+			if !ok {
+				return nil, fmt.Errorf("outbound tag %q has non-string proxySettings.tag", outboundTag)
+			}
+			if strings.TrimSpace(tag) != "" {
+				dependencies = append(dependencies, tag)
+			}
+		}
+	}
+	return dependencies, nil
+}
+
+// createTestConfig creates a test config from the selected outbound dependency
+// closure and adds only the test inbound and route rule.
+func (s *OutboundService) createTestConfig(outboundTag string, selectedOutbounds []any, testPort int) *xray.Config {
 	// Test inbound (SOCKS proxy) - only addition to inbounds
 	testInbound := xray.InboundConfig{
 		Tag:      "test-inbound",
@@ -270,8 +387,8 @@ func (s *OutboundService) createTestConfig(outboundTag string, allOutbounds []an
 	}
 
 	// Outbounds: copy all, but set noKernelTun=true for WireGuard outbounds
-	processedOutbounds := make([]any, len(allOutbounds))
-	for i, ob := range allOutbounds {
+	processedOutbounds := make([]any, len(selectedOutbounds))
+	for i, ob := range selectedOutbounds {
 		outbound, ok := ob.(map[string]any)
 		if !ok {
 			processedOutbounds[i] = ob

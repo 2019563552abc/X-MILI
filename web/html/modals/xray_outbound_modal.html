@@ -3,6 +3,8 @@
     :confirm-loading="outModal.confirmLoading" :closable="true" :mask-closable="false"
     :ok-button-props="{ props: { disabled: !outModal.isValid } }" :style="{ overflow: 'hidden' }"
     :ok-text="outModal.okText" cancel-text='{{ i18n "close" }}' :class="themeSwitcher.currentTheme">
+    <a-alert v-if="outModal.generalValidationErrors.length > 0" type="error" show-icon
+        :message="outModal.generalValidationErrors.join(' ')" :style="{ marginBottom: '12px' }"></a-alert>
     {{template "form/outbound" .}}
 </a-modal>
 <script>
@@ -19,9 +21,14 @@
         cm: null,
         duplicateTag: false,
         isValid: true,
+        jsonValid: true,
+        fieldValidationErrors: {},
+        generalValidationErrors: [],
         activeKey: '1',
         tags: [],
         ok() {
+            outModal.check();
+            if (!outModal.isValid) return;
             ObjectUtil.execute(outModal.confirm, outModal.outbound.toJson());
         },
         show({
@@ -37,6 +44,7 @@
             this.confirm = confirm;
             this.jsonMode = false;
             this.link = '';
+            this.jsonValid = true;
             this.activeKey = '1';
             this.visible = true;
             this.outbound = isEdit ? Outbound.fromJson(outbound) : new Outbound();
@@ -52,13 +60,31 @@
             outModal.confirmLoading = loading;
         },
         check() {
-            if (outModal.outbound.tag == '' || outModal.tags.includes(outModal.outbound.tag)) {
+            const validationIssues = outModal.outbound.validationIssues();
+            this.fieldValidationErrors = validationIssues.reduce((errors, issue) => {
+                if (issue.field !== 'legacy') errors[issue.field] = issue.message;
+                return errors;
+            }, {});
+            this.generalValidationErrors = validationIssues
+                .filter(issue => issue.field === 'legacy')
+                .map(issue => issue.message);
+            if (!this.jsonValid) {
+                this.generalValidationErrors.push('Outbound JSON must be an object with a valid tag, protocol, and settings object.');
+            }
+
+            const validTag = typeof outModal.outbound.tag === 'string'
+                && outModal.outbound.tag.trim() !== '';
+            const validProtocol = typeof outModal.outbound.protocol === 'string'
+                && Object.values(Protocols).includes(outModal.outbound.protocol);
+            if (!validTag || !validProtocol || outModal.tags.includes(outModal.outbound.tag)) {
                 this.duplicateTag = true;
-                this.isValid = false;
             } else {
                 this.duplicateTag = false;
-                this.isValid = true;
             }
+            this.isValid = !this.duplicateTag && this.jsonValid && validationIssues.length === 0;
+        },
+        fieldError(field) {
+            return this.fieldValidationErrors[field] || '';
         },
         toggleJson(jsonTab) {
             textAreaObj = document.getElementById('outboundJson');
@@ -71,10 +97,14 @@
                 this.cm = CodeMirror.fromTextArea(textAreaObj, app.cmOptions);
                 this.cm.on('change', editor => {
                     value = editor.getValue();
-                    if (this.isJsonString(value)) {
-                        this.outbound = Outbound.fromJson(JSON.parse(value));
-                        this.check();
+                    const parsed = this.parseOutboundJson(value);
+                    if (parsed) {
+                        this.jsonValid = true;
+                        this.outbound = Outbound.fromJson(parsed);
+                    } else {
+                        this.jsonValid = false;
                     }
+                    this.check();
                 });
                 this.activeKey = '2';
             } else {
@@ -82,16 +112,24 @@
                     this.cm.toTextArea();
                     this.cm = null;
                 }
+                this.jsonValid = true;
+                this.check();
                 this.activeKey = '1';
             }
         },
-        isJsonString(str) {
+        parseOutboundJson(str) {
             try {
-                JSON.parse(str);
+                const parsed = JSON.parse(str);
+                if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+                if (typeof parsed.tag !== 'string' || typeof parsed.protocol !== 'string') return null;
+                if (!Object.values(Protocols).includes(parsed.protocol)) return null;
+                if (parsed.settings === null || typeof parsed.settings !== 'object' || Array.isArray(parsed.settings)) {
+                    return null;
+                }
+                return parsed;
             } catch (e) {
-                return false;
+                return null;
             }
-            return true;
         },
     };
 

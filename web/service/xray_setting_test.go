@@ -75,6 +75,173 @@ func TestUnwrapXrayTemplateConfig(t *testing.T) {
 	})
 }
 
+func TestSaveXraySettingRejectsEmptyFlatVLESSOutbound(t *testing.T) {
+	config := `{"outbounds":[{"tag":"1","protocol":"vless","settings":{}}]}`
+
+	err := (&XraySettingService{}).SaveXraySetting(config)
+	if err == nil {
+		t.Fatal("SaveXraySetting accepted an empty flat VLESS outbound")
+	}
+	if !strings.Contains(err.Error(), `tag "1"`) {
+		t.Fatalf("error does not identify the invalid outbound tag: %v", err)
+	}
+}
+
+func TestSaveXraySettingRejectsFlatVLESSWithoutPort(t *testing.T) {
+	config := `{"outbounds":[{"tag":"edge","protocol":"vless","settings":{"address":"example.com","id":"test-id"}}]}`
+
+	err := (&XraySettingService{}).SaveXraySetting(config)
+	if err == nil {
+		t.Fatal("SaveXraySetting accepted a flat VLESS outbound without a port")
+	}
+	for _, want := range []string{`tag "edge"`, "settings.port"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestSaveXraySettingRejectsFlatVLESSWithoutID(t *testing.T) {
+	config := `{"outbounds":[{"tag":"edge","protocol":"vless","settings":{"address":"example.com","port":443}}]}`
+
+	err := (&XraySettingService{}).SaveXraySetting(config)
+	if err == nil {
+		t.Fatal("SaveXraySetting accepted a flat VLESS outbound without an id")
+	}
+	for _, want := range []string{`tag "edge"`, "settings.id"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestSaveXraySettingRejectsInvalidLegacyVLESSShape(t *testing.T) {
+	endpoint := `{"address":"example.com","port":443,"users":[{"id":"11111111-1111-1111-1111-111111111111","encryption":"none"}]}`
+	tests := []struct {
+		name     string
+		settings string
+		want     string
+	}{
+		{name: "no endpoints", settings: `{"vnext":[]}`, want: "settings.vnext"},
+		{name: "multiple endpoints", settings: `{"vnext":[` + endpoint + `,` + endpoint + `]}`, want: "settings.vnext"},
+		{name: "no users", settings: `{"vnext":[{"address":"example.com","port":443,"users":[]}]}`, want: "users"},
+		{name: "multiple users", settings: `{"vnext":[{"address":"example.com","port":443,"users":[{"id":"one"},{"id":"two"}]}]}`, want: "users"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := `{"outbounds":[{"tag":"legacy-edge","protocol":"vless","settings":` + tt.settings + `}]}`
+			err := (&XraySettingService{}).SaveXraySetting(config)
+			if err == nil {
+				t.Fatal("SaveXraySetting accepted an invalid legacy VLESS outbound")
+			}
+			for _, want := range []string{`tag "legacy-edge"`, tt.want} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckXrayConfigAcceptsValidVLESSShapes(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings string
+	}{
+		{
+			name:     "flat",
+			settings: `{"address":"example.com","port":443,"id":"11111111-1111-1111-1111-111111111111","encryption":"none"}`,
+		},
+		{
+			name:     "legacy single endpoint and user",
+			settings: `{"vnext":[{"address":"example.com","port":443,"users":[{"id":"11111111-1111-1111-1111-111111111111","encryption":"none"}]}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := `{"outbounds":[{"tag":"valid","protocol":"vless","settings":` + tt.settings + `}]}`
+			if err := (&XraySettingService{}).CheckXrayConfig(config); err != nil {
+				t.Fatalf("valid VLESS config was rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestSaveXraySettingRejectsVLESSWithoutEncryption(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings string
+	}{
+		{
+			name:     "flat",
+			settings: `{"address":"example.com","port":443,"id":"11111111-1111-1111-1111-111111111111"}`,
+		},
+		{
+			name:     "legacy",
+			settings: `{"vnext":[{"address":"example.com","port":443,"users":[{"id":"11111111-1111-1111-1111-111111111111"}]}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := `{"outbounds":[{"tag":"encrypted-edge","protocol":"vless","settings":` + tt.settings + `}]}`
+			err := (&XraySettingService{}).SaveXraySetting(config)
+			if err == nil {
+				t.Fatal("SaveXraySetting accepted VLESS without encryption")
+			}
+			for _, want := range []string{`tag "encrypted-edge"`, "encryption"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSaveXraySettingRejectsMixedVLESSShapes(t *testing.T) {
+	config := `{"outbounds":[{"tag":"mixed","protocol":"vless","settings":{"vnext":[],"id":"11111111-1111-1111-1111-111111111111"}}]}`
+
+	err := (&XraySettingService{}).SaveXraySetting(config)
+	if err == nil {
+		t.Fatal("SaveXraySetting accepted mixed flat and legacy VLESS settings")
+	}
+	for _, want := range []string{`tag "mixed"`, "not both"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestCheckXrayConfigAcceptsVLESSPortBoundaries(t *testing.T) {
+	for _, port := range []string{"1", "65535"} {
+		t.Run(port, func(t *testing.T) {
+			config := `{"outbounds":[{"tag":"boundary-port","protocol":"vless","settings":{"address":"example.com","port":` + port + `,"id":"11111111-1111-1111-1111-111111111111","encryption":"none"}}]}`
+			if err := (&XraySettingService{}).CheckXrayConfig(config); err != nil {
+				t.Fatalf("valid boundary port %s was rejected: %v", port, err)
+			}
+		})
+	}
+}
+
+func TestSaveXraySettingRejectsInvalidVLESSPortLiterals(t *testing.T) {
+	for _, port := range []string{"0", "65536", "-1", `"443"`, "443.0", "443e0"} {
+		t.Run(port, func(t *testing.T) {
+			config := `{"outbounds":[{"tag":"numeric-port","protocol":"vless","settings":{"address":"example.com","port":` + port + `,"id":"11111111-1111-1111-1111-111111111111","encryption":"none"}}]}`
+			err := (&XraySettingService{}).SaveXraySetting(config)
+			if err == nil {
+				t.Fatalf("SaveXraySetting accepted invalid port literal %s", port)
+			}
+			for _, want := range []string{`tag "numeric-port"`, "settings.port"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func equalJSON(t *testing.T, a, b string) bool {
 	t.Helper()
 	var va, vb any
