@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
+	xuilogger "github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/op/go-logging"
 )
 
 func setupSecuritySettingsDB(t *testing.T) {
@@ -54,6 +56,7 @@ func TestFreshSettingsUseSafePanelAndSubscriptionDefaults(t *testing.T) {
 
 func TestDefaultSettingsIncludePanelAndSubscriptionPorts(t *testing.T) {
 	setupSecuritySettingsDB(t)
+	xuilogger.InitLogger(logging.ERROR)
 
 	value, err := (&SettingService{}).GetDefaultSettings("127.0.0.1")
 	if err != nil {
