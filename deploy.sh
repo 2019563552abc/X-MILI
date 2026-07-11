@@ -17,9 +17,17 @@ MODE="install"
 REQUESTED_REPO=""
 REQUESTED_REF=""
 REQUESTED_RELEASE_TAG=""
+REQUESTED_HTTP_EXPOSURE="${X_MILI_ALLOW_INSECURE_HTTP-${XUI_ALLOW_INSECURE_HTTP-}}"
+AUTO_OPEN_FIREWALL="${X_MILI_AUTO_OPEN_FIREWALL:-true}"
 ENV_REPO="${X_MILI_REPO:-}"
 ENV_REF="${X_MILI_REF:-}"
 ENV_RELEASE_TAG="${X_MILI_RELEASE_TAG:-}"
+ENV_HTTP_EXPOSURE=""
+DEPLOY_TRANSACTION_STAGE=""
+DEPLOY_TRANSACTION_TEMP=""
+DEPLOY_TRANSACTION_SERVICE_ACTIVE=0
+DEPLOY_TRANSACTION_KEEP_TEMP=0
+DEPLOY_ROLLBACK_ARGS=()
 
 say() {
     printf '[%s] %s\n' "$APP_NAME" "$*"
@@ -30,21 +38,42 @@ fail() {
     exit 1
 }
 
+deployment_exit_handler() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    set +e
+    if [[ "$DEPLOY_TRANSACTION_STAGE" == "active" && ${#DEPLOY_ROLLBACK_ARGS[@]} -gt 0 ]]; then
+        say "Deployment was interrupted; restoring the previous release and configuration..."
+        if ! rollback_deployment "${DEPLOY_ROLLBACK_ARGS[@]}"; then
+            status=1
+        fi
+    elif [[ "$DEPLOY_TRANSACTION_STAGE" == "stopped" && "$DEPLOY_TRANSACTION_SERVICE_ACTIVE" == "1" ]]; then
+        systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ "$DEPLOY_TRANSACTION_KEEP_TEMP" == "1" && -n "$DEPLOY_TRANSACTION_TEMP" ]]; then
+        printf '[%s] Error: rollback was incomplete; recovery files were preserved at %s\n' \
+            "$APP_NAME" "$DEPLOY_TRANSACTION_TEMP" >&2
+    elif [[ -n "$DEPLOY_TRANSACTION_TEMP" ]]; then
+        rm -rf -- "$DEPLOY_TRANSACTION_TEMP"
+    fi
+    exit "$status"
+}
+
 usage() {
     cat <<'EOF'
 X-MILI GitHub Release deployment helper
 
 Usage:
-  X_MILI_REPO=owner/repo X_MILI_REF=v1.0.0 bash deploy.sh
+  X_MILI_REPO=owner/repo X_MILI_REF=v1.0.4 bash deploy.sh
   deploy.sh --update
   deploy.sh --uninstall
 
 For an update to a newer immutable release:
-  deploy.sh --update --ref v1.0.1
+  deploy.sh --update --ref v1.0.4
 
 Required for a first install:
   X_MILI_REPO   GitHub repository containing this release (owner/repo).
-  X_MILI_REF    Immutable release tag, such as v1.0.0.
+  X_MILI_REF    Immutable release tag, such as v1.0.4.
 
 Optional variables:
   X_MILI_RELEASE_TAG     Release tag to download (must match X_MILI_REF).
@@ -55,7 +84,16 @@ Optional variables:
   X_MILI_USERNAME        Initial panel username when initialization is pending.
   X_MILI_PASSWORD        Initial panel password when initialization is pending.
   X_MILI_PANEL_PORT      Initial local panel port (default: 2053).
-  X_MILI_WEB_BASE_PATH   Initial panel base path (default: /).
+  X_MILI_WEB_BASE_PATH   Initial panel base path (default: random suffix).
+  X_MILI_ALLOW_INSECURE_HTTP=true|false
+                         First install defaults to true and listens publicly on
+                         HTTP. Updates preserve the saved choice unless this is
+                         set explicitly. The saved service variable is
+                         XUI_ALLOW_INSECURE_HTTP.
+  X_MILI_AUTO_OPEN_FIREWALL=true|false
+                         Allow the panel TCP port in active UFW/firewalld on a
+                         first public install (default: true). This cannot edit
+                         a cloud firewall/security group.
   X_MILI_ASSUME_YES=1    Skip the uninstall confirmation prompt.
   X_MILI_PURGE_DATA=1    Also remove persistent data and logs during uninstall.
 
@@ -64,7 +102,7 @@ Arguments:
   --ref vX.Y.Z           Select the immutable source revision and release tag.
   --release-tag vX.Y.Z   Select a release tag explicitly (must match --ref).
 
-The installer accepts only version-like release tags (for example v1.0.0). Use
+The installer accepts only version-like release tags (for example v1.0.4). Use
 a protected tag created by the repository's release workflow so that the shell
 script, release archive and SHA256SUMS originate from the same revision.
 EOF
@@ -77,6 +115,21 @@ require_root() {
 require_systemd_linux() {
     [[ "$(uname -s)" == "Linux" ]] || fail "this deployment helper supports Linux hosts only"
     command -v systemctl >/dev/null 2>&1 || fail "systemd/systemctl is required"
+}
+
+service_is_live() {
+    local state
+    if ! state="$(systemctl show -p ActiveState --value "$SERVICE_NAME" 2>/dev/null)"; then
+        [[ -e "/etc/systemd/system/${SERVICE_NAME}.service" || -L "/etc/systemd/system/${SERVICE_NAME}.service" ]]
+        return $?
+    fi
+    case "$state" in
+        active|activating|reloading|deactivating) return 0 ;;
+        inactive|failed) return 1 ;;
+        *)
+            [[ -e "/etc/systemd/system/${SERVICE_NAME}.service" || -L "/etc/systemd/system/${SERVICE_NAME}.service" ]]
+            ;;
+    esac
 }
 
 normalize_repo() {
@@ -96,6 +149,66 @@ normalize_repo() {
 validate_release_ref() {
     local ref="$1"
     [[ "$ref" =~ ^v[0-9][A-Za-z0-9._-]*$ ]]
+}
+
+resolve_latest_release_tag() {
+    local repo="$1"
+    local tag
+    tag="$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --retry 3 --connect-timeout 15 --max-time 60 \
+        "https://api.github.com/repos/${repo}/releases/latest" \
+        | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | sed -n '1p')" || return 1
+    validate_release_ref "$tag" || return 1
+    printf '%s' "$tag"
+}
+
+resolve_release_commit() {
+    local repo="$1"
+    local tag="$2"
+    local output_file="$3"
+    local commit
+
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --retry 3 --connect-timeout 15 --max-time 60 \
+        --output "$output_file" "https://api.github.com/repos/${repo}/commits/${tag}" \
+        || return 1
+    commit="$(sed -n 's/^[[:space:]]*"sha"[[:space:]]*:[[:space:]]*"\([0-9A-Fa-f]\{40\}\)".*/\1/p' "$output_file" | sed -n '1p')"
+    [[ "$commit" =~ ^[0-9A-Fa-f]{40}$ ]] || return 1
+    printf '%s' "${commit,,}"
+}
+
+normalize_boolean() {
+    case "${1,,}" in
+        1|true|yes|on) printf 'true' ;;
+        0|false|no|off) printf 'false' ;;
+        *) return 1 ;;
+    esac
+}
+
+select_http_exposure() {
+    local first_install="$1"
+    local requested="$2"
+    local saved="$3"
+
+    if [[ -n "$requested" ]]; then
+        normalize_boolean "$requested"
+    elif [[ "$first_install" == "1" ]]; then
+        printf 'true'
+    elif [[ -n "$saved" ]]; then
+        normalize_boolean "$saved"
+    else
+        # Releases before this setting was introduced were local-only.
+        printf 'false'
+    fi
+}
+
+listen_ip_for_http_exposure() {
+    case "$1" in
+        true) printf '0.0.0.0' ;;
+        false) printf '127.0.0.1' ;;
+        *) return 1 ;;
+    esac
 }
 
 set_mode() {
@@ -150,7 +263,11 @@ load_existing_config() {
         case "$key" in
             XUI_MAIN_FOLDER|XUI_DB_FOLDER|XUI_LOG_FOLDER|XUI_BIN_FOLDER|X_MILI_DEPLOY_ROOT|X_MILI_CONFIG_DIR|X_MILI_REPO|X_MILI_REF|X_MILI_RELEASE_TAG|X_MILI_RAW_BASE)
                 printf -v "$key" '%s' "$value"
-                export "$key"
+                export "${key?}"
+                ;;
+            XUI_ALLOW_INSECURE_HTTP)
+                ENV_HTTP_EXPOSURE="$(normalize_boolean "$value")" \
+                    || fail "deployment environment has an invalid XUI_ALLOW_INSECURE_HTTP value"
                 ;;
             *)
                 fail "unsupported deployment environment key: $key"
@@ -184,7 +301,7 @@ detect_architecture() {
 install_runtime_dependencies() {
     local missing=0
     local command_name
-    for command_name in curl tar gzip sha256sum openvpn ip ping ps od tr realpath; do
+    for command_name in curl tar gzip sha256sum openvpn ip ss ping ps od tr realpath; do
         command -v "$command_name" >/dev/null 2>&1 || missing=1
     done
 
@@ -217,6 +334,7 @@ download_release() {
     local asset="x-mili-linux-${arch}.tar.gz"
     local release_url="https://github.com/${repo}/releases/download/${tag}"
     local expected
+    local archive_details
 
     say "Downloading ${asset} from GitHub Release ${tag}..." >&2
     curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 \
@@ -224,20 +342,33 @@ download_release() {
     curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 \
         --output "$temp_dir/SHA256SUMS" "$release_url/SHA256SUMS"
 
-    expected="$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$temp_dir/SHA256SUMS")"
+    expected="$(awk -v asset="$asset" '
+        $2 == asset { checksum=$1; count++ }
+        END { if (count == 1) print checksum; else exit 1 }
+    ' "$temp_dir/SHA256SUMS")" \
+        || fail "SHA256SUMS must contain exactly one entry for ${asset}"
     [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || fail "SHA256SUMS does not contain a valid checksum for ${asset}"
     printf '%s  %s\n' "$expected" "$asset" > "$temp_dir/asset.sha256"
     (
         cd "$temp_dir"
-        sha256sum --check asset.sha256
+        sha256sum --check asset.sha256 >/dev/null
     )
 
     tar -tzf "$temp_dir/$asset" > "$temp_dir/archive-paths"
     if grep -Eq '(^/|(^|/)\.\.(/|$))' "$temp_dir/archive-paths"; then
         fail "release archive contains an unsafe path"
     fi
+    archive_details="$temp_dir/archive-details"
+    LC_ALL=C tar -tvzf "$temp_dir/$asset" > "$archive_details" \
+        || fail "release archive metadata is invalid"
+    if awk '{ type=substr($1,1,1); if (type != "-" && type != "d") bad=1 } END { exit bad ? 0 : 1 }' "$archive_details"; then
+        fail "release archive contains a link, device, or another unsupported entry type"
+    fi
     mkdir -p "$temp_dir/extract"
     tar --no-same-owner --no-same-permissions -xzf "$temp_dir/$asset" -C "$temp_dir/extract"
+    if find "$temp_dir/extract" -mindepth 1 ! -type f ! -type d -print -quit | grep -q .; then
+        fail "extracted release contains an unsupported filesystem object"
+    fi
     printf '%s' "$temp_dir/extract"
 }
 
@@ -248,10 +379,10 @@ validate_release_bundle() {
 
     [[ ! -L "$release_dir/x-ui" && ! -L "$release_dir/x-ui.sh" && ! -L "$release_dir/deploy.sh" && ! -L "$release_dir/bin/xray-linux-${arch}" && ! -L "$release_dir/.x-mili-commit" ]] \
         || fail "release bundle contains an unexpected symbolic link"
-    [[ -x "$release_dir/x-ui" ]] || fail "release bundle is missing an executable x-ui binary"
-    [[ -x "$release_dir/x-ui.sh" ]] || fail "release bundle is missing x-ui.sh"
-    [[ -x "$release_dir/deploy.sh" ]] || fail "release bundle is missing deploy.sh"
-    [[ -x "$release_dir/bin/xray-linux-${arch}" ]] || fail "release bundle is missing xray-linux-${arch}"
+    [[ -f "$release_dir/x-ui" && -x "$release_dir/x-ui" ]] || fail "release bundle is missing an executable x-ui binary"
+    [[ -f "$release_dir/x-ui.sh" && -x "$release_dir/x-ui.sh" ]] || fail "release bundle is missing x-ui.sh"
+    [[ -f "$release_dir/deploy.sh" && -x "$release_dir/deploy.sh" ]] || fail "release bundle is missing deploy.sh"
+    [[ -f "$release_dir/bin/xray-linux-${arch}" && -x "$release_dir/bin/xray-linux-${arch}" ]] || fail "release bundle is missing xray-linux-${arch}"
     [[ -f "$release_dir/.x-mili-commit" ]] || fail "release bundle is missing .x-mili-commit"
 
     commit="$(tr -d '[:space:]' < "$release_dir/.x-mili-commit")"
@@ -267,6 +398,7 @@ write_runtime_environment() {
     local repo="$5"
     local ref="$6"
     local tag="$7"
+    local http_exposure="$8"
     local config_dir
     local temporary_env
 
@@ -288,6 +420,7 @@ X_MILI_REPO=${repo}
 X_MILI_REF=${ref}
 X_MILI_RELEASE_TAG=${tag}
 X_MILI_RAW_BASE=https://raw.githubusercontent.com/${repo}/${ref}
+XUI_ALLOW_INSECURE_HTTP=${http_exposure}
 EOF
     chown root:root "$temporary_env"
     chmod 0600 "$temporary_env"
@@ -396,13 +529,15 @@ pending_bootstrap() {
 initialize_panel_credentials() {
     local binary="$1"
     local temporary_dir="$2"
+    local recovery_file="$3"
     local username="${X_MILI_USERNAME:-}"
     local password="${X_MILI_PASSWORD:-}"
     local port="${X_MILI_PANEL_PORT:-2053}"
-    local web_base_path="${X_MILI_WEB_BASE_PATH:-/}"
+    local web_base_path="${X_MILI_WEB_BASE_PATH:-}"
     local generated=0
     local status
     local password_file
+    local recovery_tmp
 
     if pending_bootstrap "$binary"; then
         :
@@ -425,13 +560,38 @@ initialize_panel_credentials() {
         password="$(random_string 32)"
         generated=1
     fi
+    if [[ -z "$web_base_path" ]]; then
+        web_base_path="/$(random_string 18)/"
+    fi
 
-    [[ "$username" =~ ^[A-Za-z0-9._-]{3,64}$ ]] || fail "initial username must contain 3-64 letters, numbers, dots, underscores or hyphens"
-    [[ "$password" =~ ^[^[:space:]]{12,128}$ ]] || fail "initial password must be 12-128 non-space characters"
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( port >= 1 && port <= 65535 )) || fail "initial panel port is invalid"
-    [[ "$web_base_path" == /* && "$web_base_path" != *' '* ]] || fail "initial web base path must start with / and contain no spaces"
+    if [[ ! "$username" =~ ^[A-Za-z0-9._-]{3,64}$ ]]; then
+        printf '[%s] Error: initial username must contain 3-64 letters, numbers, dots, underscores or hyphens\n' "$APP_NAME" >&2
+        return 1
+    fi
+    if [[ ! "$password" =~ ^[^[:space:]]{12,128}$ ]]; then
+        printf '[%s] Error: initial password must be 12-128 non-space characters\n' "$APP_NAME" >&2
+        return 1
+    fi
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( port < 1 || port > 65535 )); then
+        printf '[%s] Error: initial panel port is invalid\n' "$APP_NAME" >&2
+        return 1
+    fi
+    if [[ "$web_base_path" != /* || "$web_base_path" == *[[:space:]]* ]]; then
+        printf '[%s] Error: initial web base path must start with / and contain no spaces\n' "$APP_NAME" >&2
+        return 1
+    fi
 
     say "Configuring initial panel credentials..."
+    recovery_tmp="$(mktemp "${recovery_file}.XXXXXX")" || return 1
+    {
+        printf 'username: %s\n' "$username"
+        printf 'password: %s\n' "$password"
+        printf 'port: %s\n' "$port"
+        printf 'webBasePath: %s\n' "$web_base_path"
+    } > "$recovery_tmp"
+    chown root:root "$recovery_tmp"
+    chmod 0600 "$recovery_tmp"
+    mv -f -- "$recovery_tmp" "$recovery_file"
     password_file="$(mktemp "${temporary_dir}/panel-password.XXXXXX")" || return 1
     chmod 0600 "$password_file"
     printf '%s' "$password" > "$password_file"
@@ -452,7 +612,234 @@ initialize_panel_credentials() {
     if [[ "$generated" -eq 1 ]]; then
         printf '\nSave this generated panel password now (it will not be shown again):\n%s\n\n' "$username : $password"
     fi
+    say "Initial credentials are temporarily recoverable at ${recovery_file} until deployment completes."
     unset X_MILI_PASSWORD password
+}
+
+configure_panel_http_exposure() {
+    local binary="$1"
+    local http_exposure="$2"
+    local listen_ip
+
+    listen_ip="$(listen_ip_for_http_exposure "$http_exposure")" || {
+        printf '[%s] Error: invalid panel HTTP exposure value\n' "$APP_NAME" >&2
+        return 1
+    }
+    say "Setting panel listen address to ${listen_ip}..."
+    "$binary" setting -listenIP "$listen_ip" >/dev/null
+}
+
+open_panel_firewall_port() {
+    local port="$1" auto_open opened=0
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+        printf '[%s] Error: invalid panel port for firewall rule: %s\n' "$APP_NAME" "$port" >&2
+        return 1
+    fi
+    auto_open="$(normalize_boolean "$AUTO_OPEN_FIREWALL")" || {
+        printf '[%s] Error: X_MILI_AUTO_OPEN_FIREWALL must be true or false\n' "$APP_NAME" >&2
+        return 1
+    }
+    [[ "$auto_open" == "true" ]] || return 0
+
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+        if ufw allow "${port}/tcp" >/dev/null; then
+            opened=1
+            say "Allowed ${port}/TCP in UFW."
+        else
+            say "Warning: UFW could not allow ${port}/TCP; check it manually."
+        fi
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --quiet --permanent --query-port="${port}/tcp"; then
+            opened=1
+        elif firewall-cmd --quiet --permanent --add-port="${port}/tcp" && firewall-cmd --quiet --reload; then
+            opened=1
+            say "Allowed ${port}/TCP in firewalld."
+        else
+            say "Warning: firewalld could not allow ${port}/TCP; check it manually."
+        fi
+    fi
+
+    if [[ "$opened" == "0" ]]; then
+        say "No active UFW/firewalld was detected; the host firewall was not changed. Allow ${port}/TCP in the cloud firewall/security group."
+    fi
+}
+
+is_valid_ipv4() {
+    local candidate="$1" octet
+    local -a octets
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS='.' read -r -a octets <<< "$candidate"
+    [[ "${#octets[@]}" -eq 4 ]] || return 1
+    for octet in "${octets[@]}"; do
+        [[ ${#octet} -le 3 ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+is_valid_ipv6() {
+    local candidate="$1" remainder group compressed=0 group_count=0
+    local -a groups
+
+    [[ "$candidate" == *:* && "$candidate" != ":" && "$candidate" =~ ^[0-9A-Fa-f:]+$ && ${#candidate} -le 39 && "$candidate" != *:::* ]] || return 1
+    if [[ "$candidate" == *::* ]]; then
+        compressed=1
+        remainder="${candidate#*::}"
+        [[ "$remainder" != *::* ]] || return 1
+    fi
+    IFS=':' read -r -a groups <<< "$candidate"
+    for group in "${groups[@]}"; do
+        [[ -z "$group" ]] && continue
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        ((group_count += 1))
+    done
+    if [[ "$compressed" == "1" ]]; then
+        (( group_count < 8 ))
+    else
+        (( group_count == 8 ))
+    fi
+}
+
+fetch_public_address() {
+    local family="$1" validator="$2" endpoint candidate
+    shift 2
+    for endpoint in "$@"; do
+        candidate="$(curl "-$family" --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 3 --max-time 6 "$endpoint" 2>/dev/null || true)"
+        candidate="${candidate//$'\r'/}"
+        candidate="${candidate//$'\n'/}"
+        candidate="${candidate//[[:space:]]/}"
+        if "$validator" "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_public_ipv4() {
+    fetch_public_address 4 is_valid_ipv4 \
+        https://api.ipify.org https://ipv4.icanhazip.com https://v4.ident.me
+}
+
+get_public_ipv6() {
+    fetch_public_address 6 is_valid_ipv6 \
+        https://api6.ipify.org https://ipv6.icanhazip.com https://6.ident.me
+}
+
+format_url_host() {
+    local ipv4="$1" ipv6="$2"
+    if [[ -n "$ipv4" ]]; then
+        printf '%s' "$ipv4"
+    elif [[ -n "$ipv6" ]]; then
+        printf '[%s]' "$ipv6"
+    else
+        printf 'SERVER_PUBLIC_IP'
+    fi
+}
+
+normalize_web_base_path() {
+    local path="$1"
+    [[ -n "$path" ]] || path="/"
+    [[ "$path" == /* ]] || path="/$path"
+    [[ "$path" == */ ]] || path="$path/"
+    printf '%s' "$path"
+}
+
+extract_panel_setting() {
+    local settings="$1"
+    local key="$2"
+    awk -v wanted="${key}:" '$1 == wanted { print $2; exit }' <<< "$settings"
+}
+
+verify_deployed_service() {
+    local binary="$1"
+    local settings port
+    local active_checks=5
+    local listener_checks=10
+
+    while ((active_checks-- > 0)); do
+        systemctl is-active --quiet "$SERVICE_NAME" || return 1
+        sleep 1
+    done
+
+    settings="$("$binary" setting -show true 2>/dev/null)" || return 1
+    port="$(extract_panel_setting "$settings" port)"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( port >= 1 && port <= 65535 )) || return 1
+
+    while ((listener_checks-- > 0)); do
+        systemctl is-active --quiet "$SERVICE_NAME" || return 1
+        if ss -ltnH 2>/dev/null \
+            | awk -v suffix=":${port}" '$4 ~ suffix "$" { found=1 } END { exit !found }'; then
+            systemctl is-active --quiet "$SERVICE_NAME"
+            return $?
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+print_deployment_guide() {
+    local binary="$1"
+    local http_exposure="$2"
+    local settings port web_path cert listen_ip protocol public_ipv4 public_ipv6 url_host check_host panel_url
+    local direct_public=0
+
+    settings="$("$binary" setting -show true 2>/dev/null || true)"
+    port="$(extract_panel_setting "$settings" port)"
+    web_path="$(extract_panel_setting "$settings" webBasePath)"
+    port="${port:-2053}"
+    web_path="$(normalize_web_base_path "$web_path")"
+    cert="$("$binary" setting -getCert true 2>/dev/null | awk -F': ' '/^cert:/ { print $2; exit }' | tr -d '[:space:]' || true)"
+    listen_ip="$("$binary" setting -getListen true 2>/dev/null | awk -F': ' '/^listenIP:/ { print $2; exit }' | tr -d '[:space:]' || true)"
+    public_ipv4="$(get_public_ipv4 || true)"
+    public_ipv6="$(get_public_ipv6 || true)"
+    [[ -n "$cert" ]] && protocol="https" || protocol="http"
+
+    if [[ "$listen_ip" == "0.0.0.0" || "$listen_ip" == "::" || "$listen_ip" == "[::]" ]]; then
+        if [[ -n "$cert" || "$http_exposure" == "true" ]]; then
+            direct_public=1
+        fi
+    fi
+    if [[ "$direct_public" == "1" ]]; then
+        if [[ "$listen_ip" == "0.0.0.0" ]]; then
+            url_host="${public_ipv4:-SERVER_PUBLIC_IPV4}"
+        else
+            url_host="$(format_url_host "$public_ipv4" "$public_ipv6")"
+        fi
+    else
+        url_host="127.0.0.1"
+    fi
+    if [[ "$listen_ip" == "0.0.0.0" ]]; then
+        check_host="${public_ipv4:-SERVER_PUBLIC_IPV4}"
+    else
+        check_host="${public_ipv4:-${public_ipv6:-SERVER_PUBLIC_IP}}"
+    fi
+    panel_url="${protocol}://${url_host}:${port}${web_path}"
+
+    printf '\n'
+    say "Deployment completed. Management command: ml"
+    say "Panel URL: ${panel_url}"
+    [[ -n "$public_ipv4" ]] && say "Public IPv4: ${public_ipv4}"
+    [[ -n "$public_ipv6" ]] && say "Public IPv6: ${public_ipv6}"
+    [[ -n "$public_ipv6" && "$listen_ip" == "0.0.0.0" ]] && say "IPv6 was detected, but the current 0.0.0.0 listener is the IPv4 public entry point."
+    say "Listen address: ${listen_ip:-unknown}:${port}"
+    if [[ "$direct_public" != "1" ]]; then
+        say "The panel is local-only. Use an SSH tunnel or configure TLS before public access."
+        say "SSH tunnel: ssh -L ${port}:127.0.0.1:${port} root@SERVER_PUBLIC_IP"
+    elif [[ -z "$cert" ]]; then
+        printf '[%s] SECURITY WARNING: public plaintext HTTP is enabled. Credentials and subscriptions can be intercepted. Bind a domain and configure TLS immediately.\n' "$APP_NAME" >&2
+    fi
+    say "Ports: ${port}/TCP=current panel for both HTTP and domain-bound HTTPS; 80/TCP=ACME HTTP-01; 443/TCP is only for a separate reverse proxy or a panel moved to 443."
+    say "Note: http://domain uses port 80 and is not the current panel URL; keep :${port}${web_path}."
+    say "Server listener check: ss -ltnp | grep -E ':(${port}|80)[[:space:]]'"
+    say "External check (run from another host/mobile network): curl -v --connect-timeout 5 '${panel_url}' -o /dev/null"
+    say "External port check: nc -vz ${check_host} 80 ; nc -vz ${check_host} ${port}"
+    say "If local access works but external access fails, check the cloud firewall/security group, host firewall, NAT forwarding and DNS A/AAAA records. A local python http.server test does not prove Internet reachability."
+    say "Use 'ml update' for future release updates."
+    printf '\n'
 }
 
 switch_current_release() {
@@ -539,7 +926,7 @@ assert_managed_installation() {
     if [[ -e "$env_file" || -L "$env_file" ]]; then
         fail "a deployment environment file exists without a managed release; inspect it before retrying"
     fi
-    if [[ -e "$data_dir/x-ui.db" || -e "$data_dir/x-ui.db-wal" || -e "$data_dir/x-ui.db-shm" ]]; then
+    if [[ -e "$data_dir/x-ui.db" || -e "$data_dir/x-ui.db-journal" || -e "$data_dir/x-ui.db-wal" || -e "$data_dir/x-ui.db-shm" ]]; then
         fail "a panel database exists without a managed release; inspect it before retrying"
     fi
 }
@@ -561,9 +948,9 @@ restore_path() {
     local backup="$2"
     local existed="$3"
 
-    rm -f -- "$destination"
+    rm -f -- "$destination" || return 1
     if [[ "$existed" == "1" ]]; then
-        cp -a -- "$backup" "$destination"
+        cp -a -- "$backup" "$destination" || return 1
     fi
 }
 
@@ -574,7 +961,7 @@ backup_database() {
     local found=0
 
     install -d -m 0700 "$backup_dir"
-    for database_file in "$data_dir/x-ui.db" "$data_dir/x-ui.db-wal" "$data_dir/x-ui.db-shm"; do
+    for database_file in "$data_dir/x-ui.db" "$data_dir/x-ui.db-journal" "$data_dir/x-ui.db-wal" "$data_dir/x-ui.db-shm"; do
         if [[ -e "$database_file" ]]; then
             [[ ! -L "$database_file" ]] || fail "database files must not be symbolic links"
             cp -a -- "$database_file" "$backup_dir/"
@@ -589,9 +976,10 @@ restore_database() {
     local backup_dir="$2"
     local existed="$3"
 
-    rm -f -- "$data_dir/x-ui.db" "$data_dir/x-ui.db-wal" "$data_dir/x-ui.db-shm"
+    rm -f -- "$data_dir/x-ui.db" "$data_dir/x-ui.db-journal" "$data_dir/x-ui.db-wal" "$data_dir/x-ui.db-shm" \
+        || return 1
     if [[ "$existed" == "1" ]]; then
-        cp -a -- "$backup_dir/." "$data_dir/"
+        cp -a -- "$backup_dir/." "$data_dir/" || return 1
     fi
 }
 
@@ -612,21 +1000,39 @@ rollback_deployment() {
     local data_dir="${14}"
     local database_backup="${15}"
     local had_database="${16}"
+    local rollback_failed=0
+    local stop_checks=10
 
+    DEPLOY_TRANSACTION_STAGE=""
+    DEPLOY_TRANSACTION_KEEP_TEMP=1
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-    restore_previous_release "$old_target" "$current" || true
-    restore_database "$data_dir" "$database_backup" "$had_database" || true
-    restore_path "$env_file" "$env_backup" "$had_env" || true
-    restore_path "$unit_file" "$unit_backup" "$had_unit" || true
-    restore_path /usr/bin/ml "$ml_backup" "$had_ml" || true
-    restore_path /usr/bin/x-ui "$xui_backup" "$had_xui" || true
-    systemctl daemon-reload || true
+    while ((stop_checks-- > 0)); do
+        service_is_live || break
+        sleep 1
+    done
+    if service_is_live; then
+        say "Automatic rollback was stopped because ${SERVICE_NAME} is still active; program and database files were not touched by rollback."
+        return 1
+    fi
+    restore_previous_release "$old_target" "$current" || rollback_failed=1
+    restore_database "$data_dir" "$database_backup" "$had_database" || rollback_failed=1
+    restore_path "$env_file" "$env_backup" "$had_env" || rollback_failed=1
+    restore_path "$unit_file" "$unit_backup" "$had_unit" || rollback_failed=1
+    restore_path /usr/bin/ml "$ml_backup" "$had_ml" || rollback_failed=1
+    restore_path /usr/bin/x-ui "$xui_backup" "$had_xui" || rollback_failed=1
+    systemctl daemon-reload || rollback_failed=1
 
-    if [[ -n "$old_target" && "$service_was_active" == "1" ]]; then
-        systemctl restart "$SERVICE_NAME" || true
-    elif [[ -z "$old_target" ]]; then
+    if [[ "$rollback_failed" == "0" && -n "$old_target" && "$service_was_active" == "1" ]]; then
+        systemctl restart "$SERVICE_NAME" || rollback_failed=1
+    elif [[ "$rollback_failed" == "0" && -z "$old_target" ]]; then
         systemctl disable "$SERVICE_NAME" 2>/dev/null || true
     fi
+    if [[ "$rollback_failed" == "0" ]]; then
+        DEPLOY_TRANSACTION_KEEP_TEMP=0
+        return 0
+    fi
+    say "Rollback was incomplete; the service was left stopped and the deployment backup will be preserved for manual recovery."
+    return 1
 }
 
 safe_remove_directory() {
@@ -678,9 +1084,10 @@ apply_requested_configuration() {
 }
 
 deploy_release() {
-    local deploy_root config_dir env_file data_dir log_dir repo ref tag arch temp_dir extracted_dir commit releases_dir target current old_target
+    local deploy_root config_dir env_file data_dir log_dir repo ref tag arch temp_dir extracted_dir commit tag_commit releases_dir target current old_target release_stage
     local unit_file env_backup unit_backup ml_backup xui_backup database_backup
-    local had_env had_unit had_ml had_xui had_database service_was_active=0
+    local had_env had_unit had_ml had_xui had_database http_exposure first_install apply_http_exposure=0 service_was_active=0
+    local settings firewall_port stop_checks initial_service_state
 
     config_dir="${X_MILI_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"
     deploy_root="${X_MILI_DEPLOY_ROOT:-$DEFAULT_DEPLOY_ROOT}"
@@ -697,34 +1104,79 @@ deploy_release() {
     assert_managed_installation "$deploy_root" "$current" "$releases_dir" "$env_file" "$data_dir"
 
     repo="$(normalize_repo "${X_MILI_REPO:-}")" || fail "X_MILI_REPO must be a GitHub owner/repository value"
-    ref="${X_MILI_REF:-${X_MILI_RELEASE_TAG:-}}"
-    tag="${X_MILI_RELEASE_TAG:-$ref}"
-    validate_release_ref "$ref" || fail "X_MILI_REF must be an immutable version tag (for example v1.0.0)"
+    arch="$(detect_architecture)"
+    install_runtime_dependencies
+    if [[ "$MODE" == "update" && -z "$REQUESTED_REF" && -z "$REQUESTED_RELEASE_TAG" ]]; then
+        tag="$(resolve_latest_release_tag "$repo")" \
+            || fail "could not resolve the latest published release for ${repo}"
+        ref="$tag"
+        say "Latest published release: ${tag}"
+    else
+        ref="${X_MILI_REF:-${X_MILI_RELEASE_TAG:-}}"
+        tag="${X_MILI_RELEASE_TAG:-$ref}"
+    fi
+    validate_release_ref "$ref" || fail "X_MILI_REF must be an immutable version tag (for example v1.0.4)"
     validate_release_ref "$tag" || fail "X_MILI_RELEASE_TAG must be an immutable version tag"
     [[ "$ref" == "$tag" ]] || fail "X_MILI_REF and X_MILI_RELEASE_TAG must match so the launcher and archive come from one immutable revision"
 
-    arch="$(detect_architecture)"
-    install_runtime_dependencies
     temp_dir="$(mktemp -d)"
-    trap 'rm -rf -- "$temp_dir"' EXIT
+    DEPLOY_TRANSACTION_TEMP="$temp_dir"
+    DEPLOY_TRANSACTION_KEEP_TEMP=0
+    trap deployment_exit_handler EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
     extracted_dir="$(download_release "$repo" "$tag" "$arch" "$temp_dir")"
     commit="$(validate_release_bundle "$extracted_dir" "$arch")"
+    tag_commit="$(resolve_release_commit "$repo" "$tag" "$temp_dir/release-commit.json")" \
+        || fail "could not resolve the GitHub commit for release tag ${tag}"
+    [[ "${commit,,}" == "$tag_commit" ]] \
+        || fail "release bundle commit does not match GitHub tag ${tag}"
 
     ensure_managed_directory "$deploy_root" 0755
     ensure_managed_directory "$releases_dir" 0755
-    ensure_managed_directory "$data_dir" 0750
+    ensure_managed_directory "$data_dir" 0700
     ensure_managed_directory "$log_dir" 0750
     target="$releases_dir/$commit"
     [[ ! -L "$target" ]] || fail "release target must not be a symbolic link: $target"
     if [[ ! -e "$target" ]]; then
-        install -d -m 0755 "$target"
-        cp -a "$extracted_dir/." "$target/"
+        release_stage="$(mktemp -d "${releases_dir}/.${commit}.staging.XXXXXX")"
+        if ! cp -a "$extracted_dir/." "$release_stage/" \
+            || ! validate_release_bundle "$release_stage" "$arch" >/dev/null; then
+            rm -rf -- "$release_stage"
+            fail "could not stage the validated release"
+        fi
+        if ! mv -T -- "$release_stage" "$target" 2>/dev/null; then
+            rm -rf -- "$release_stage"
+            [[ -d "$target" && ! -L "$target" ]] || fail "could not activate the staged release directory"
+        fi
     fi
     validate_release_bundle "$target" "$arch" >/dev/null
 
     old_target="$(readlink -f "$current" 2>/dev/null || true)"
     if [[ -n "$old_target" && "$old_target" != "$releases_dir/"* ]]; then
         fail "current release points outside the managed releases directory: $old_target"
+    fi
+    if [[ -z "$old_target" ]]; then
+        first_install=1
+    else
+        first_install=0
+    fi
+    http_exposure="$(select_http_exposure "$first_install" "$REQUESTED_HTTP_EXPOSURE" "$ENV_HTTP_EXPOSURE")" \
+        || fail "X_MILI_ALLOW_INSECURE_HTTP must be true or false"
+    if [[ "$first_install" == "1" || -n "$REQUESTED_HTTP_EXPOSURE" ]]; then
+        apply_http_exposure=1
+    fi
+    if [[ "$first_install" == "0" \
+        && "$old_target" == "$target" \
+        && "${ENV_REPO:-}" == "$repo" \
+        && "${ENV_REF:-}" == "$ref" \
+        && "${ENV_RELEASE_TAG:-}" == "$tag" \
+        && -z "$REQUESTED_HTTP_EXPOSURE" ]]; then
+        trap - EXIT INT TERM HUP
+        DEPLOY_TRANSACTION_TEMP=""
+        rm -rf -- "$temp_dir"
+        say "Already on the latest Release ${tag} (${commit:0:12}); no update is needed."
+        return 0
     fi
     prepare_current_switch "$current"
 
@@ -739,9 +1191,20 @@ deploy_release() {
     had_ml="$(backup_path /usr/bin/ml "$ml_backup")"
     had_xui="$(backup_path /usr/bin/x-ui "$xui_backup")"
 
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        systemctl stop "$SERVICE_NAME"
-        service_was_active=1
+    initial_service_state="$(systemctl show -p ActiveState --value "$SERVICE_NAME" 2>/dev/null || true)"
+    case "$initial_service_state" in
+        active|activating|reloading) service_was_active=1 ;;
+    esac
+    DEPLOY_TRANSACTION_SERVICE_ACTIVE="$service_was_active"
+    DEPLOY_TRANSACTION_STAGE="stopped"
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    stop_checks=10
+    while ((stop_checks-- > 0)); do
+        service_is_live || break
+        sleep 1
+    done
+    if service_is_live; then
+        fail "${SERVICE_NAME} did not stop cleanly; no database or release files were changed"
     fi
     if ! had_database="$(backup_database "$data_dir" "$database_backup")"; then
         if [[ -n "$old_target" && "$service_was_active" == "1" ]]; then
@@ -749,12 +1212,20 @@ deploy_release() {
         fi
         fail "could not back up the SQLite database before deployment"
     fi
+    DEPLOY_ROLLBACK_ARGS=(
+        "$old_target" "$current" "$service_was_active"
+        "$env_file" "$env_backup" "$had_env"
+        "$unit_file" "$unit_backup" "$had_unit"
+        "$ml_backup" "$had_ml" "$xui_backup" "$had_xui"
+        "$data_dir" "$database_backup" "$had_database"
+    )
+    DEPLOY_TRANSACTION_STAGE="active"
 
     if ! switch_current_release "$target" "$current"; then
         rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
         fail "could not activate the new release"
     fi
-    if ! write_runtime_environment "$env_file" "$deploy_root" "$data_dir" "$log_dir" "$repo" "$ref" "$tag"; then
+    if ! write_runtime_environment "$env_file" "$deploy_root" "$data_dir" "$log_dir" "$repo" "$ref" "$tag" "$http_exposure"; then
         rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
         fail "could not write the deployment environment"
     fi
@@ -777,34 +1248,59 @@ deploy_release() {
     export X_MILI_REF="$ref"
     export X_MILI_RELEASE_TAG="$tag"
     export X_MILI_RAW_BASE="https://raw.githubusercontent.com/${repo}/${ref}"
+    export XUI_ALLOW_INSECURE_HTTP="$http_exposure"
 
-    if [[ -z "$old_target" ]] && ! initialize_panel_credentials "$current/x-ui" "$temp_dir"; then
+    if [[ -z "$old_target" ]] && ! initialize_panel_credentials "$current/x-ui" "$temp_dir" "$data_dir/.x-mili-initial-credentials"; then
         rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
         fail "initial panel configuration failed"
     fi
-
+    if [[ "$apply_http_exposure" == "1" ]] && ! configure_panel_http_exposure "$current/x-ui" "$http_exposure"; then
+        rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
+        fail "could not configure the panel listen address"
+    fi
     if ! systemctl daemon-reload; then
         rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
         fail "could not reload systemd"
     fi
-    if ! systemctl enable --now "$SERVICE_NAME"; then
-        rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
-        fail "could not start ${SERVICE_NAME}; the previous release was restored when available"
+    if [[ "$first_install" == "1" ]]; then
+        if ! systemctl enable --now "$SERVICE_NAME"; then
+            rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
+            fail "could not start ${SERVICE_NAME}; the previous release was restored when available"
+        fi
+    elif [[ "$service_was_active" == "1" ]]; then
+        if ! systemctl start "$SERVICE_NAME"; then
+            rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
+            fail "could not restart ${SERVICE_NAME}; the previous release was restored"
+        fi
+    else
+        say "${SERVICE_NAME} was inactive before the update and remains inactive."
     fi
-    sleep 2
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-        rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
-        fail "${SERVICE_NAME} did not remain active; the previous release was restored when available"
+    if [[ "$first_install" == "1" || "$service_was_active" == "1" ]]; then
+        if ! verify_deployed_service "$current/x-ui"; then
+            rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
+            fail "${SERVICE_NAME} did not remain active with its panel port listening; the previous release was restored when available"
+        fi
+    fi
+    if [[ "$apply_http_exposure" == "1" && "$http_exposure" == "true" ]]; then
+        settings="$("$current/x-ui" setting -show true 2>/dev/null || true)"
+        firewall_port="$(extract_panel_setting "$settings" port)"
+        if ! open_panel_firewall_port "${firewall_port:-2053}"; then
+            rollback_deployment "$old_target" "$current" "$service_was_active" "$env_file" "$env_backup" "$had_env" "$unit_file" "$unit_backup" "$had_unit" "$ml_backup" "$had_ml" "$xui_backup" "$had_xui" "$data_dir" "$database_backup" "$had_database"
+            fail "could not validate or configure the panel firewall port"
+        fi
     fi
 
     # Keep old release directories so a failed later update can roll back
     # without downloading an older package again.
-    trap - EXIT
+    DEPLOY_TRANSACTION_STAGE=""
+    DEPLOY_ROLLBACK_ARGS=()
+    DEPLOY_TRANSACTION_KEEP_TEMP=0
+    trap - EXIT INT TERM HUP
+    DEPLOY_TRANSACTION_TEMP=""
     rm -rf -- "$temp_dir"
 
-    say "Deployment completed. The panel is bound to localhost by default."
-    say "Put a TLS-enabled reverse proxy in front of it before exposing it to the Internet."
-    say "Use 'ml' for the management menu and 'ml update' for future release updates."
+    print_deployment_guide "$current/x-ui" "$http_exposure"
+    rm -f -- "$data_dir/.x-mili-initial-credentials"
 }
 
 uninstall() {
@@ -813,6 +1309,7 @@ uninstall() {
     local data_dir="${XUI_DB_FOLDER:-$DEFAULT_DATA_DIR}"
     local log_dir="${XUI_LOG_FOLDER:-$DEFAULT_LOG_DIR}"
     local env_file="$config_dir/x-mili.env"
+    local cron_tmp=""
 
     validate_managed_path "X_MILI_CONFIG_DIR" "$config_dir" "/etc"
     validate_managed_path "X_MILI_DEPLOY_ROOT" "$deploy_root" "/opt"
@@ -831,7 +1328,15 @@ uninstall() {
     fi
 
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+    systemctl disable --now x-mili-acme-renew.timer 2>/dev/null || true
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service" /usr/bin/ml /usr/bin/x-ui
+    rm -f /etc/systemd/system/x-mili-acme-renew.service /etc/systemd/system/x-mili-acme-renew.timer
+    if command -v crontab >/dev/null 2>&1; then
+        cron_tmp="$(mktemp)"
+        crontab -l 2>/dev/null | sed '\|/usr/bin/ml ssl cron|d' > "$cron_tmp" || true
+        crontab "$cron_tmp" 2>/dev/null || true
+        rm -f -- "$cron_tmp"
+    fi
     systemctl daemon-reload
     safe_remove_directory "$deploy_root"
     safe_remove_directory "$config_dir"
@@ -845,52 +1350,61 @@ uninstall() {
     fi
 }
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --update)
-            set_mode "update"
-            shift
-            ;;
-        --uninstall)
-            set_mode "uninstall"
-            shift
-            ;;
-        --repo)
-            [[ $# -ge 2 ]] || fail "--repo requires an owner/repository value"
-            REQUESTED_REPO="$2"
-            shift 2
-            ;;
-        --ref)
-            [[ $# -ge 2 ]] || fail "--ref requires a version tag"
-            REQUESTED_REF="$2"
-            shift 2
-            ;;
-        --release-tag)
-            [[ $# -ge 2 ]] || fail "--release-tag requires a version tag"
-            REQUESTED_RELEASE_TAG="$2"
-            shift 2
-            ;;
-        --help|-h)
-            usage
-            exit 0
-            ;;
-        *)
-            fail "unknown argument: $1 (try --help)"
-            ;;
-    esac
-done
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --update)
+                set_mode "update"
+                shift
+                ;;
+            --uninstall)
+                set_mode "uninstall"
+                shift
+                ;;
+            --repo)
+                [[ $# -ge 2 ]] || fail "--repo requires an owner/repository value"
+                REQUESTED_REPO="$2"
+                shift 2
+                ;;
+            --ref)
+                [[ $# -ge 2 ]] || fail "--ref requires a version tag"
+                REQUESTED_REF="$2"
+                shift 2
+                ;;
+            --release-tag)
+                [[ $# -ge 2 ]] || fail "--release-tag requires a version tag"
+                REQUESTED_RELEASE_TAG="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                return 0
+                ;;
+            *)
+                fail "unknown argument: $1 (try --help)"
+                ;;
+        esac
+    done
 
-require_root
-require_systemd_linux
+    require_root
+    require_systemd_linux
 
-if [[ "$MODE" != "install" ]]; then
-    load_existing_config
+    if [[ "$MODE" != "install" ]]; then
+        load_existing_config
+    fi
+    apply_requested_configuration
+
+    if [[ "$MODE" == "uninstall" ]]; then
+        uninstall
+        return 0
+    fi
+
+    normalize_boolean "$AUTO_OPEN_FIREWALL" >/dev/null \
+        || fail "X_MILI_AUTO_OPEN_FIREWALL must be true or false"
+
+    deploy_release
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-apply_requested_configuration
-
-if [[ "$MODE" == "uninstall" ]]; then
-    uninstall
-    exit 0
-fi
-
-deploy_release

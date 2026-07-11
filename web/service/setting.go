@@ -20,6 +20,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/util/reflect_util"
 	"github.com/mhsanaei/3x-ui/v2/web/entity"
 	"github.com/mhsanaei/3x-ui/v2/xray"
+	"gorm.io/gorm"
 )
 
 //go:embed config.json
@@ -187,8 +188,7 @@ func (s *SettingService) ResetSettings() error {
 		Where("1 = 1").Error
 }
 
-func (s *SettingService) getSetting(key string) (*model.Setting, error) {
-	db := database.GetDB()
+func (s *SettingService) getSettingWithDB(db *gorm.DB, key string) (*model.Setting, error) {
 	setting := &model.Setting{}
 	err := db.Model(model.Setting{}).Where("key = ?", key).First(setting).Error
 	if err != nil {
@@ -197,9 +197,12 @@ func (s *SettingService) getSetting(key string) (*model.Setting, error) {
 	return setting, nil
 }
 
-func (s *SettingService) saveSetting(key string, value string) error {
-	setting, err := s.getSetting(key)
-	db := database.GetDB()
+func (s *SettingService) getSetting(key string) (*model.Setting, error) {
+	return s.getSettingWithDB(database.GetDB(), key)
+}
+
+func (s *SettingService) saveSettingWithDB(db *gorm.DB, key string, value string) error {
+	setting, err := s.getSettingWithDB(db, key)
 	if database.IsNotFound(err) {
 		return db.Create(&model.Setting{
 			Key:   key,
@@ -211,6 +214,10 @@ func (s *SettingService) saveSetting(key string, value string) error {
 	setting.Key = key
 	setting.Value = value
 	return db.Save(setting).Error
+}
+
+func (s *SettingService) saveSetting(key string, value string) error {
+	return s.saveSettingWithDB(database.GetDB(), key, value)
 }
 
 func (s *SettingService) getString(key string) (string, error) {
@@ -375,6 +382,29 @@ func (s *SettingService) GetCertFile() (string, error) {
 
 func (s *SettingService) SetKeyFile(webKeyFile string) error {
 	return s.setString("webKeyFile", webKeyFile)
+}
+
+// SetCertificateFiles updates panel and subscription certificate paths in one
+// transaction so command-line certificate changes cannot leave a partial pair.
+func (s *SettingService) SetCertificateFiles(certFile, keyFile string) error {
+	values := []struct {
+		key   string
+		value string
+	}{
+		{key: "webCertFile", value: certFile},
+		{key: "webKeyFile", value: keyFile},
+		{key: "subCertFile", value: certFile},
+		{key: "subKeyFile", value: keyFile},
+	}
+
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+		for _, item := range values {
+			if err := s.saveSettingWithDB(tx, item.key, item.value); err != nil {
+				return fmt.Errorf("set %s: %w", item.key, err)
+			}
+		}
+		return nil
+	})
 }
 
 func (s *SettingService) GetKeyFile() (string, error) {

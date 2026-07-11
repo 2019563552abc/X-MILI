@@ -5,11 +5,11 @@ package database
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
-	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 
@@ -27,13 +27,17 @@ import (
 var db *gorm.DB
 
 const (
-	defaultUsername       = "admin"
-	legacyDefaultPassword = "admin"
+	defaultUsername                   = "admin"
+	legacyDefaultPassword             = "admin"
+	privateDirectoryMode  os.FileMode = 0o700
+	privateDatabaseMode   os.FileMode = 0o600
 
 	// BootstrapPendingSettingKey marks an installation whose initial panel
 	// credentials still need to be configured by the installer or CLI.
 	BootstrapPendingSettingKey = "bootstrapPending"
 )
+
+var sqliteFileSuffixes = [...]string{"", "-journal", "-wal", "-shm"}
 
 func initModels() error {
 	models := []any{
@@ -202,11 +206,96 @@ func isTableEmpty(tableName string) (bool, error) {
 	return count == 0, err
 }
 
-// InitDB sets up the database connection, migrates models, and runs seeders.
-func InitDB(dbPath string) error {
-	dir := path.Dir(dbPath)
-	err := os.MkdirAll(dir, fs.ModePerm)
+// prepareDatabaseStorage creates and hardens the database directory and file
+// before SQLite opens them. Pre-creating the database with mode 0600 avoids a
+// window where a permissive process umask could expose a newly-created file.
+// Existing installations are preserved; only their permission bits are
+// tightened.
+func prepareDatabaseStorage(dbPath string) error {
+	if dbPath == "" {
+		return errors.New("database path is empty")
+	}
+
+	dir := filepath.Dir(dbPath)
+	cleanDir := filepath.Clean(dir)
+	volumeRoot := filepath.VolumeName(cleanDir) + string(os.PathSeparator)
+	if cleanDir == volumeRoot {
+		return fmt.Errorf("database directory must not be a filesystem root: %s", dir)
+	}
+	switch filepath.ToSlash(cleanDir) {
+	case "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/usr/local", "/var", "/var/lib", "/var/log":
+		return fmt.Errorf("database directory must be a dedicated subdirectory: %s", dir)
+	}
+	if err := os.MkdirAll(dir, privateDirectoryMode); err != nil {
+		return fmt.Errorf("create database directory: %w", err)
+	}
+	dirInfo, err := os.Lstat(dir)
 	if err != nil {
+		return fmt.Errorf("inspect database directory: %w", err)
+	}
+	if dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() {
+		return fmt.Errorf("database directory must be a regular directory: %s", dir)
+	}
+	// A relative database filename uses the caller's working directory. Do not
+	// change that directory's permissions; the database file is still private.
+	if cleanDir != "." {
+		if err := os.Chmod(dir, privateDirectoryMode); err != nil {
+			return fmt.Errorf("secure database directory: %w", err)
+		}
+	}
+
+	if fileInfo, statErr := os.Lstat(dbPath); statErr == nil {
+		if fileInfo.Mode()&os.ModeSymlink != 0 || !fileInfo.Mode().IsRegular() {
+			return fmt.Errorf("database path must be a regular file: %s", dbPath)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect database file: %w", statErr)
+	}
+
+	file, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, privateDatabaseMode)
+	if err != nil {
+		return fmt.Errorf("open database file: %w", err)
+	}
+	if err := file.Chmod(privateDatabaseMode); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("secure database file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close database file: %w", err)
+	}
+
+	return hardenDatabaseFiles(dbPath)
+}
+
+// hardenDatabaseFiles also covers SQLite's persistent journal and WAL sidecar
+// files when they already exist. Systemd and Docker set umask 0077 so sidecars
+// created later inherit private permissions as well.
+func hardenDatabaseFiles(dbPath string) error {
+	for _, suffix := range sqliteFileSuffixes {
+		filePath := dbPath + suffix
+		fileInfo, err := os.Lstat(filePath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("inspect database file %q: %w", filePath, err)
+		}
+		if fileInfo.Mode()&os.ModeSymlink != 0 || !fileInfo.Mode().IsRegular() {
+			return fmt.Errorf("database file must be regular: %s", filePath)
+		}
+		if err := os.Chmod(filePath, privateDatabaseMode); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("secure database file %q: %w", filePath, err)
+		}
+	}
+	return nil
+}
+
+// InitDB sets up the database connection, migrates models, and runs seeders.
+func InitDB(dbPath string) (retErr error) {
+	if err := prepareDatabaseStorage(dbPath); err != nil {
 		return err
 	}
 
@@ -221,10 +310,16 @@ func InitDB(dbPath string) error {
 	c := &gorm.Config{
 		Logger: gormLogger,
 	}
+	var err error
 	db, err = gorm.Open(sqlite.Open(dbPath), c)
 	if err != nil {
 		return err
 	}
+	// Migrations can create SQLite sidecar files. Tighten them on every return,
+	// including initialization failures, without hiding the original error.
+	defer func() {
+		retErr = errors.Join(retErr, hardenDatabaseFiles(dbPath))
+	}()
 
 	if err := initModels(); err != nil {
 		return err
@@ -241,7 +336,10 @@ func InitDB(dbPath string) error {
 	if err := runSeeders(isUsersEmpty); err != nil {
 		return err
 	}
-	return rotateLegacyDefaultCredentials()
+	if err := rotateLegacyDefaultCredentials(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // CloseDB closes the database connection if it exists.

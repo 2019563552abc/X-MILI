@@ -247,7 +247,7 @@ func updateSetting(port int, username string, password string, webBasePath strin
 		if err := settingService.SetListen(listenIP); err != nil {
 			return fmt.Errorf("set listen IP: %w", err)
 		}
-		fmt.Printf("listen %v set successfully", listenIP)
+		fmt.Printf("Listen IP set successfully: %v\n", listenIP)
 	}
 
 	return nil
@@ -295,45 +295,22 @@ func readPasswordFile(path string) (string, error) {
 }
 
 // updateCert updates the SSL certificate files for the panel.
-func updateCert(publicKey string, privateKey string) {
+func updateCert(publicKey string, privateKey string) error {
 	err := database.InitDB(config.GetDBPath())
 	if err != nil {
-		fmt.Println(err)
-		return
+		return fmt.Errorf("initialize database: %w", err)
 	}
 
-	if (privateKey != "" && publicKey != "") || (privateKey == "" && publicKey == "") {
-		settingService := service.SettingService{}
-		err = settingService.SetCertFile(publicKey)
-		if err != nil {
-			fmt.Println("set certificate public key failed:", err)
-		} else {
-			fmt.Println("set certificate public key success")
-		}
-
-		err = settingService.SetKeyFile(privateKey)
-		if err != nil {
-			fmt.Println("set certificate private key failed:", err)
-		} else {
-			fmt.Println("set certificate private key success")
-		}
-
-		err = settingService.SetSubCertFile(publicKey)
-		if err != nil {
-			fmt.Println("set certificate for subscription public key failed:", err)
-		} else {
-			fmt.Println("set certificate for subscription public key success")
-		}
-
-		err = settingService.SetSubKeyFile(privateKey)
-		if err != nil {
-			fmt.Println("set certificate for subscription private key failed:", err)
-		} else {
-			fmt.Println("set certificate for subscription private key success")
-		}
-	} else {
-		fmt.Println("both public and private key should be entered.")
+	if (privateKey == "") != (publicKey == "") {
+		return fmt.Errorf("both certificate and private key must be provided together")
 	}
+
+	settingService := service.SettingService{}
+	if err := settingService.SetCertificateFiles(publicKey, privateKey); err != nil {
+		return err
+	}
+	fmt.Println("Certificate paths updated successfully")
+	return nil
 }
 
 // GetCertificate displays the current SSL certificate settings if getCert is true.
@@ -492,9 +469,13 @@ func main() {
 			return
 		}
 		if reset {
-			updateCert("", "")
+			err = updateCert("", "")
 		} else {
-			updateCert(webCertFile, webKeyFile)
+			err = updateCert(webCertFile, webKeyFile)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "update certificate paths failed:", err)
+			os.Exit(1)
 		}
 	default:
 		fmt.Println("Invalid subcommands")

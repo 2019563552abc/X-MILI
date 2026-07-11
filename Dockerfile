@@ -4,6 +4,7 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /app
 ARG TARGETARCH
+ARG TARGETVARIANT
 
 RUN apk --no-cache --update add \
   build-base \
@@ -16,7 +17,14 @@ COPY . .
 ENV CGO_ENABLED=1
 ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
 RUN go build -ldflags "-w -s" -o build/x-ui main.go
-RUN ./DockerInit.sh "$TARGETARCH"
+RUN chmod +x ./DockerInit.sh \
+  && EFFECTIVE_ARCH="${TARGETARCH:-amd64}" \
+  && INIT_ARCH="$EFFECTIVE_ARCH" \
+  && if [ "$EFFECTIVE_ARCH" = "arm" ] && [ "${TARGETVARIANT:-v7}" = "v6" ]; then INIT_ARCH=armv6; fi \
+  && ./DockerInit.sh "$INIT_ARCH" \
+  && test -x "/app/build/bin/xray-linux-${EFFECTIVE_ARCH}" \
+  && test -s /app/build/bin/geoip.dat \
+  && test -s /app/build/bin/geosite.dat
 
 # ========================================================
 # Stage: Final Image of X-MILI
@@ -33,7 +41,8 @@ RUN apk add --no-cache --update \
   curl \
   iproute2 \
   openvpn \
-  openssl
+  openssl \
+  socat
 
 COPY --from=builder /app/build/ /app/
 COPY --from=builder /app/DockerEntrypoint.sh /app/

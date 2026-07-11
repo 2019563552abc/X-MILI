@@ -44,10 +44,19 @@ X-MILI 是一个简洁版代理面板：
 | 适合场景 | 长期运行、生产使用、路由稳定优先 |
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/2019563552abc/X-MILI/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/2019563552abc/X-MILI/main/install.sh)
 ```
 
-安装器默认将未配置 TLS 的面板限制在 `127.0.0.1`。公网访问请优先配置 HTTPS 反向代理或面板证书；仅在临时兼容场景下，才显式设置 `X_MILI_ALLOW_INSECURE_HTTP=true`，并尽快恢复 TLS。
+首次全新安装会随机生成账号、密码和安全路径，并临时通过 `http://服务器公网IP:面板端口/安全路径/` 开放面板。安装器会为已启用的 UFW/firewalld 放行面板端口，但云厂商安全组仍需手动放行。公网明文 HTTP 只能用于首次配置，请安装后立即运行 `ml ssl` 绑定域名证书。
+
+需要从一开始就只允许 SSH 隧道访问时，可关闭公网 HTTP：
+
+```bash
+X_MILI_ALLOW_INSECURE_HTTP=false \
+bash <(curl -fsSL https://raw.githubusercontent.com/2019563552abc/X-MILI/main/install.sh)
+```
+
+重复运行安装器或执行更新时会保留现有公网访问选择，不会擅自改变监听方式。
 
 ### Docker 版
 
@@ -55,29 +64,29 @@ bash <(curl -Ls https://raw.githubusercontent.com/2019563552abc/X-MILI/main/inst
 
 | 项目 | 说明 |
 | --- | --- |
-| 支持系统 | 能正常运行 Docker 和 Docker Compose 插件的 Linux VPS |
+| 支持系统 | 能正常运行 Docker 和 Docker Compose 插件的 Linux VPS（amd64、386、arm/v6、arm/v7、arm64） |
 | 必要条件 | root、Docker、Docker Compose、TUN/TAP、host 网络 |
 | 适合场景 | 快速重装、容器管理、测试环境 |
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/2019563552abc/X-MILI/main/install-docker.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/2019563552abc/X-MILI/main/install-docker.sh)
 ```
 
-安装完成后，终端会输出面板地址、账号、密码和安全路径。
+Docker 首次安装同样默认输出公网 IP 面板地址，并为已启用的 UFW/firewalld 放行面板端口；可通过 `X_MILI_ALLOW_INSECURE_HTTP=false` 改为仅本机监听。安装完成后，终端会输出面板地址、账号、密码和安全路径。云厂商安全组仍需手动放行。
 
 ## 快速教程
 
 1. 执行一键安装脚本。
 2. 选择 `简体中文`。
 3. 设置面板账号、密码、端口和安全路径，也可以直接回车随机生成。
-4. 打开终端输出的面板地址。
-5. 添加入站和客户端。
-6. 进入 `Xray 配置` -> `VPNGate`。
-7. 拉取 VPNGate 节点。
-8. 选择默认、固定国家或动态国家规则。
-9. 点击添加出站，等待 OpenVPN 连接成功。
-10. 保存 Xray 配置。
-11. 在路由规则中选择 `vpngate` 出站标签。
+4. 在云厂商安全组放行安装结果显示的面板 TCP 端口，并打开完整面板地址。
+5. 运行 `ml ssl`，确认域名 A 记录已指向服务器公网 IP。脚本会处理已启用的 UFW/firewalld TCP 80 规则，云厂商安全组/云防火墙仍需手动放行 TCP 80。
+6. 添加入站和客户端。
+7. 进入 `Xray 配置` -> `VPNGate`。
+8. 拉取 VPNGate 节点。
+9. 选择默认、固定国家或动态国家规则。
+10. 点击添加出站，等待 OpenVPN 连接成功。
+11. 保存 Xray 配置，并在路由规则中选择 `vpngate` 出站标签。
 
 提示：`vpngate` 不会默认接管全部流量，必须在路由规则里手动选择。
 
@@ -108,6 +117,7 @@ ml restart-xray     # 重启 Xray
 ml status           # 查看状态
 ml settings         # 查看设置
 ml log              # 查看日志
+ml ssl              # SSL 证书管理
 ml update           # 更新
 ml uninstall        # 卸载
 ```
@@ -123,6 +133,7 @@ ml restart-xray     # 重启 Xray
 ml status           # 查看状态
 ml log              # 查看日志
 ml shell            # 进入容器
+ml ssl              # SSL 证书管理
 ml update           # 更新
 ml uninstall        # 卸载，默认保留数据
 ```
@@ -131,7 +142,25 @@ ml uninstall        # 卸载，默认保留数据
 
 ### 面板打不开
 
-检查 VPS 安全组和系统防火墙，放行安装完成时输出的面板端口。
+先确认使用的是安装结果里的完整地址，例如 `http://公网IP:2053/安全路径/`。裸 `http://域名` 访问的是 80 端口，不是默认的 2053 面板端口。
+
+```bash
+ss -ltnp | grep -E ':(80|443|2053)[[:space:]]' || true
+ufw status verbose 2>/dev/null || true
+firewall-cmd --list-all 2>/dev/null || true
+```
+
+本机能访问但外网打不开时，检查云厂商安全组、NAT 映射和宿主机防火墙。
+
+### 绑定域名和 SSL
+
+先把域名 A 记录指向服务器公网 IPv4，关闭临时占用 80 的程序，并在云厂商安全组放行 TCP 80，再运行：
+
+```bash
+ml ssl
+```
+
+证书绑定后，面板仍使用原有端口，通常应访问 `https://域名:2053/安全路径/`。脚本不会自动把面板改到 443；如需省略端口，请另行配置 443 HTTPS 反向代理，或确认 443 未被 Xray 入站占用后再修改面板端口。
 
 ### VPNGate 连接失败
 
@@ -155,29 +184,29 @@ ml uninstall        # 卸载，默认保留数据
 1. 将仓库推送到自己的 GitHub 仓库后，创建并推送不可变版本标签：
 
    ```bash
-   git tag -a v1.0.0 -m "v1.0.0"
-   git push origin v1.0.0
+   git tag -a v1.0.4 -m "v1.0.4"
+   git push origin v1.0.4
    ```
 
    建议在 GitHub 仓库设置中为 `v*` 启用 Tag protection，禁止强推或删除已发布标签。
 
 2. 等待 GitHub Actions 的 `Prebuilt Linux Bundle` 工作流完成。它会创建同名 Release，并上传 `x-mili-linux-amd64.tar.gz` 与 `SHA256SUMS`。
 
-3. 在 Linux 服务器上执行（将仓库名和版本替换为自己的值）：
+3. 在 Linux 服务器上执行：
 
    ```bash
-   X_MILI_REPO=your-github-user/X-MILI \
-   X_MILI_REF=v1.0.0 \
-   bash <(curl -fsSL https://raw.githubusercontent.com/your-github-user/X-MILI/v1.0.0/deploy.sh)
+   X_MILI_REPO=2019563552abc/X-MILI \
+   X_MILI_REF=v1.0.4 \
+   bash <(curl -fsSL https://raw.githubusercontent.com/2019563552abc/X-MILI/v1.0.4/deploy.sh)
    ```
 
-安装器会校验下载包、保留旧版本以便回滚、创建 `x-ui` systemd 服务，并把数据保存在 `/var/lib/x-mili`。面板默认仅监听本机地址；需要公网访问时，请在前面配置 HTTPS 反向代理。
+安装器会校验下载包、保留旧版本以便回滚、创建 `x-ui` systemd 服务，并把数据保存在 `/var/lib/x-mili`。首次安装默认临时开放公网 IP HTTP，更新会保留当前选择；完成首次登录后请运行 `ml ssl` 切换到域名 HTTPS。设置 `X_MILI_ALLOW_INSECURE_HTTP=false` 可让首次安装仅监听本机地址。
 
 该部署器不会覆盖旧版 `/usr/local/x-ui` + `/etc/x-ui` 安装，以免新空数据库掩盖旧配置。检测到旧安装时会停止并提示；请先完成数据库迁移或单独备份、卸载旧实例。
 
 后续更新和卸载：
 
 ```bash
-sudo ml update --ref v1.0.1
+sudo ml update --ref v1.0.4
 sudo ml uninstall
 ```

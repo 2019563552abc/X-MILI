@@ -2,14 +2,42 @@ name: Prebuilt Linux Bundle
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v[0-9]*'
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate source and installers
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev shellcheck
+          bash -n deploy.sh install.sh install-docker.sh update.sh x-ui.sh DockerEntrypoint.sh DockerInit.sh
+          shellcheck --severity=error deploy.sh install.sh install-docker.sh update.sh x-ui.sh DockerEntrypoint.sh DockerInit.sh
+          go test ./...
+          go vet ./...
+
+      - name: Build Docker image
+        run: docker build --tag "x-mili-ci:${GITHUB_SHA}" .
+
   build:
+    needs: validate
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     strategy:
@@ -24,7 +52,6 @@ jobs:
       - name: Build bundle
         run: |
           COMMIT_SHA="$(git rev-parse HEAD)"
-          bash -n deploy.sh x-ui.sh
           docker run --rm --platform "${{ matrix.platform }}" \
             -e GITHUB_SHA="$COMMIT_SHA" \
             -v "$PWD:/src" -w /src golang:1.26.2-bookworm sh -ec '
@@ -57,6 +84,8 @@ jobs:
     needs: build
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:

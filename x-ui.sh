@@ -52,11 +52,11 @@ function LOGI() {
 is_port_in_use() {
     local port="$1"
     if command -v ss > /dev/null 2>&1; then
-        ss -ltn 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {exit 0} END {exit 1}'
+        ss -ltnH 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
         return
     fi
     if command -v netstat > /dev/null 2>&1; then
-        netstat -lnt 2> /dev/null | awk -v p=":${port} " '$4 ~ p {exit 0} END {exit 1}'
+        netstat -lnt 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END {exit !found}'
         return
     fi
     if command -v lsof > /dev/null 2>&1; then
@@ -109,6 +109,9 @@ os_version=$(grep "^VERSION_ID" /etc/os-release | cut -d '=' -f2 | tr -d '"' | t
 
 # Declare Variables
 xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+if [[ ! -x "${xui_folder}/x-ui" && -x /app/x-ui ]]; then
+    xui_folder="/app"
+fi
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 log_folder="${XUI_LOG_FOLDER:=/var/log/x-ui}"
 mkdir -p "${log_folder}"
@@ -118,7 +121,7 @@ iplimit_banned_log_path="${log_folder}/3xipl-banned.log"
 confirm() {
     local default_label="Default"
     is_zh && default_label="默认"
-    if [[ $# > 1 ]]; then
+    if [[ $# -gt 1 ]]; then
         echo && read -rp "$1 [${default_label} $2]: " temp
         if [[ "${temp}" == "" ]]; then
             temp=$2
@@ -214,15 +217,23 @@ uninstall() {
         return 0
     fi
 
+    local uninstall_acme_bin="${X_MILI_ACME_BIN:-/root/.acme.sh/acme.sh}"
+    local uninstall_acme_home="${X_MILI_ACME_HOME:-/root/.acme.sh}"
+    if [[ -x "$uninstall_acme_bin" ]]; then
+        "$uninstall_acme_bin" --home "$uninstall_acme_home" --uninstall-cronjob > /dev/null 2>&1 || true
+    fi
+
     if [[ $release == "alpine" ]]; then
         rc-service x-ui stop 2> /dev/null || true
         rc-update del x-ui 2> /dev/null || true
         rm /etc/init.d/x-ui -f
     else
+        systemctl disable --now x-mili-acme-renew.timer 2> /dev/null || true
         systemctl stop x-ui 2> /dev/null || true
         systemctl disable x-ui 2> /dev/null || true
         rm ${xui_service}/x-ui.service -f
         rm /etc/systemd/system/x-ui.service -f
+        rm -f /etc/systemd/system/x-mili-acme-renew.service /etc/systemd/system/x-mili-acme-renew.timer
         systemctl daemon-reload
         systemctl reset-failed
     fi
@@ -255,7 +266,11 @@ uninstall() {
     rm /var/log/x-ui/ -rf
     rm /root/cert/ -rf
     rm /root/.acme.sh/ -rf
-    rm ${xui_folder}/ -rf
+    case "$xui_folder" in
+        /usr/local/*|/opt/*) rm -rf -- "${xui_folder:?}/" ;;
+        /app) : ;; # Docker program files belong to the image and host wrapper.
+        *) LOGE "Refusing to remove unsafe program directory: $xui_folder"; return 1 ;;
+    esac
     rm -rf /usr/local/etc/x-ui /var/lib/x-ui /tmp/x-mili-* /tmp/vpngate-check-*.ovpn
 
     if [ -d "/etc/fail2ban" ]; then
@@ -508,21 +523,35 @@ stop() {
 }
 
 restart() {
-    if [[ $release == "alpine" ]]; then
-        rc-service x-ui restart
+    local restart_rc=0
+    if [[ -f /.dockerenv ]]; then
+        # The image runs x-ui as PID 1. SIGHUP asks x-ui to reload both web
+        # servers in-process, so an interactive docker exec session can verify
+        # the new listener before returning.
+        if kill -HUP 1 2> /dev/null; then
+            sleep 3
+            kill -0 1 2> /dev/null || restart_rc=1
+        else
+            restart_rc=1
+        fi
+    elif [[ $release == "alpine" ]] && command -v rc-service > /dev/null 2>&1; then
+        rc-service x-ui restart || restart_rc=$?
+    elif command -v systemctl > /dev/null 2>&1; then
+        systemctl restart x-ui || restart_rc=$?
     else
-        systemctl restart x-ui
+        LOGE "No supported service manager was found."
+        restart_rc=1
     fi
-    sleep 2
-    check_status
-    if [[ $? == 0 ]]; then
-        LOGI "x-ui and xray Restarted successfully"
+
+    if [[ $restart_rc -eq 0 ]]; then
+        LOGI "x-ui and xray restarted successfully"
     else
-        LOGE "Panel restart failed, Probably because it takes longer than two seconds to start, Please check the log information later"
+        LOGE "Panel restart failed. Please check the service/container logs."
     fi
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
+    return "$restart_rc"
 }
 
 restart_xray() {
@@ -742,7 +771,10 @@ update_shell() {
 
 # 0: running, 1: not running, 2: not installed
 check_status() {
-    if [[ $release == "alpine" ]]; then
+    if [[ -f /.dockerenv && -x "${xui_folder}/x-ui" ]]; then
+        kill -0 1 2> /dev/null && return 0
+        return 1
+    elif [[ $release == "alpine" ]]; then
         if [[ ! -f /etc/init.d/x-ui ]]; then
             return 2
         fi
@@ -1154,796 +1186,2145 @@ update_geo() {
 
     before_show_menu
 }
+# X-MILI managed certificate workflow.  Keep every panel/configuration change
+# transactional: a failed issue, install, restart, or TLS probe restores the
+# previous certificate paths, listen address, and insecure-HTTP opt-in.
+X_MILI_CERT_ROOT="${X_MILI_CERT_ROOT:-/root/cert}"
+if [[ -f /.dockerenv ]]; then
+    # The certificate directory is a host volume in the Docker deployment;
+    # keeping acme.sh here preserves account and renewal state on recreate.
+    X_MILI_ACME_HOME="${X_MILI_ACME_HOME:-${X_MILI_CERT_ROOT}/.acme.sh}"
+else
+    X_MILI_ACME_HOME="${X_MILI_ACME_HOME:-/root/.acme.sh}"
+fi
+X_MILI_ACME_BIN="${X_MILI_ACME_HOME}/acme.sh"
+SSL_CERT_BACKUP=""
+SSL_CERT_HAD_OLD=0
+SSL_CERT_INSTALL_ACTIVE=0
+SSL_ACME_BACKUP=""
+SSL_ACME_HAD_RSA=0
+SSL_ACME_HAD_ECC=0
+SSL_ACME_HAD_ACCOUNT=0
+SSL_ACME_SNAPSHOT_COMPLETE=0
+SSL_ACME_DEPLOY_STAGE=""
+SSL_TRANSACTION_DOMAIN=""
+SSL_TRANSACTION_LOCK=""
+SSL_TRANSACTION_LOCK_FD=""
+SSL_TRANSACTION_LOCK_MODE=""
+SSL_PANEL_ROLLBACK_ACTIVE=0
+SSL_PANEL_ROLLBACK_FORBIDDEN=0
+SSL_PANEL_OLD_CERT=""
+SSL_PANEL_OLD_KEY=""
+SSL_PANEL_OLD_LISTEN=""
+SSL_PANEL_OLD_INSECURE=false
+SSL_SCHEDULER_BACKUP=""
+SSL_SCHEDULER_SNAPSHOT_COMPLETE=0
+SSL_SCHEDULER_MODE=""
+SSL_SCHEDULER_HAD_CRONTAB=0
+SSL_SCHEDULER_HAD_SERVICE=0
+SSL_SCHEDULER_HAD_TIMER=0
+SSL_SCHEDULER_TIMER_ENABLED=0
+SSL_SCHEDULER_TIMER_ACTIVE=0
+SSL_SCHEDULER_CROND_ENABLED=0
+SSL_SCHEDULER_CROND_ACTIVE=0
+SSL_SCHEDULER_SYSTEMD_DIR=""
+SSL_SCHEDULER_DOCKER_MARKER=""
 
-install_acme() {
-    # Check if acme.sh is already installed
-    if command -v ~/.acme.sh/acme.sh &> /dev/null; then
-        LOGI "acme.sh is already installed."
+ssl_lock_metadata_is_stale() {
+    local modified now
+    modified=$(stat -c %Y -- "$1" 2> /dev/null) || return 1
+    now=$(date +%s) || return 1
+    [[ "$modified" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ \
+        && $((now - modified)) -gt 60 ]]
+}
+
+ssl_acquire_lock() {
+    local lock pid lock_fd proc_start saved_start stale_lock
+    mkdir -p "$X_MILI_CERT_ROOT" || return 1
+    lock="${X_MILI_CERT_ROOT}/.x-mili-ssl.lock"
+
+    if command -v flock > /dev/null 2>&1; then
+        # Migrate the directory used by older releases without ever removing a
+        # lock that can still belong to a live SSL process.
+        if [[ -d "$lock" ]]; then
+            pid=$(cat "${lock}/pid" 2> /dev/null || true)
+            if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+                if ! ssl_lock_metadata_is_stale "$lock"; then
+                    ssl_log_e "SSL 锁正在迁移或状态不完整，请稍后重试。" \
+                        "The SSL lock is being migrated or is incomplete; retry shortly."
+                    return 1
+                fi
+            fi
+            if kill -0 "$pid" 2> /dev/null \
+                && tr '\0' ' ' < "/proc/${pid}/cmdline" 2> /dev/null \
+                    | grep -Eq '(^|[ /])(x-ui\.sh|ml)( |$)'; then
+                ssl_log_e "另一个 SSL 操作正在运行（PID ${pid}）。" \
+                    "Another SSL operation is already running (PID ${pid})."
+                return 1
+            fi
+            stale_lock="${lock}.stale.$$.$RANDOM"
+            mv -- "$lock" "$stale_lock" 2> /dev/null || return 1
+            rm -rf -- "$stale_lock"
+        fi
+
+        exec {lock_fd}>> "$lock" || return 1
+        if ! flock -n "$lock_fd"; then
+            pid=$(cat "$lock" 2> /dev/null || true)
+            exec {lock_fd}>&-
+            if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                ssl_log_e "另一个 SSL 操作正在运行（PID ${pid}）。" \
+                    "Another SSL operation is already running (PID ${pid})."
+            else
+                ssl_log_e "另一个 SSL 操作正在运行。" \
+                    "Another SSL operation is already running."
+            fi
+            return 1
+        fi
+        chmod 0600 "$lock" || { exec {lock_fd}>&-; return 1; }
+        printf '%s\n' "$$" > "$lock" || { exec {lock_fd}>&-; return 1; }
+        SSL_TRANSACTION_LOCK="$lock"
+        SSL_TRANSACTION_LOCK_FD="$lock_fd"
+        SSL_TRANSACTION_LOCK_MODE=flock
         return 0
     fi
 
-    LOGI "Installing acme.sh..."
-    cd ~ || return 1 # Ensure you can change to the home directory
-
-    curl -s https://get.acme.sh | sh
-    if [ $? -ne 0 ]; then
-        LOGE "Installation of acme.sh failed."
-        return 1
-    else
-        LOGI "Installation of acme.sh succeeded."
+    # Portable fallback for minimal systems.  PID plus /proc start time avoids
+    # treating an unrelated process that reused the PID as the lock owner.
+    lock="${lock}.d"
+    if ! mkdir "$lock" 2> /dev/null; then
+        pid=$(cat "${lock}/pid" 2> /dev/null || true)
+        saved_start=$(cat "${lock}/start" 2> /dev/null || true)
+        proc_start=""
+        if [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/stat" ]]; then
+            proc_start=$(awk '{print $22}' "/proc/${pid}/stat" 2> /dev/null || true)
+        fi
+        if [[ ! "$pid" =~ ^[0-9]+$ || -z "$saved_start" ]]; then
+            if ! ssl_lock_metadata_is_stale "$lock"; then
+                ssl_log_e "SSL 锁状态尚未完整，请稍后重试。" \
+                    "The SSL lock metadata is not complete yet; retry shortly."
+                return 1
+            fi
+        fi
+        if [[ -n "$proc_start" && "$proc_start" == "$saved_start" ]] \
+            && kill -0 "$pid" 2> /dev/null; then
+            ssl_log_e "另一个 SSL 操作正在运行（PID ${pid}）。" \
+                "Another SSL operation is already running (PID ${pid})."
+            return 1
+        fi
+        stale_lock="${lock}.stale.$$.$RANDOM"
+        mv -- "$lock" "$stale_lock" 2> /dev/null || return 1
+        rm -rf -- "$stale_lock"
+        mkdir "$lock" 2> /dev/null || return 1
     fi
-
-    return 0
+    proc_start=$(awk '{print $22}' "/proc/$$/stat" 2> /dev/null || true)
+    printf '%s\n' "$$" > "${lock}/pid" || { rm -rf -- "$lock"; return 1; }
+    printf '%s\n' "$proc_start" > "${lock}/start" || { rm -rf -- "$lock"; return 1; }
+    chmod 0700 "$lock" || { rm -rf -- "$lock"; return 1; }
+    SSL_TRANSACTION_LOCK="$lock"
+    SSL_TRANSACTION_LOCK_MODE="mkdir"
 }
 
-ssl_cert_issue_main() {
-    if is_zh; then
-        echo -e "${green}\t1.${plain} 获取 SSL 证书 (域名)"
-        echo -e "${green}\t2.${plain} 吊销证书"
-        echo -e "${green}\t3.${plain} 强制更新"
-        echo -e "${green}\t4.${plain} 显示已有的域名证书"
-        echo -e "${green}\t5.${plain} 为面板设置证书路径"
-        echo -e "${green}\t6.${plain} 获取 IP 地址的 SSL 证书 (短期证书，自动续签)"
-        echo -e "${green}\t0.${plain} 返回主菜单"
-        read -rp "请选择: " choice
+ssl_release_lock() {
+    if [[ "$SSL_TRANSACTION_LOCK_MODE" == flock \
+        && "$SSL_TRANSACTION_LOCK_FD" =~ ^[0-9]+$ ]]; then
+        : > "$SSL_TRANSACTION_LOCK" 2> /dev/null || true
+        exec {SSL_TRANSACTION_LOCK_FD}>&-
+    elif [[ "$SSL_TRANSACTION_LOCK_MODE" == mkdir && -n "$SSL_TRANSACTION_LOCK" ]]; then
+        rm -rf -- "$SSL_TRANSACTION_LOCK"
+    fi
+    SSL_TRANSACTION_LOCK="" SSL_TRANSACTION_LOCK_FD="" SSL_TRANSACTION_LOCK_MODE=""
+}
+
+ssl_transaction_rollback() {
+    local rc=0 domain="${SSL_TRANSACTION_DOMAIN:-${SSL_SELECTED_DOMAIN:-}}"
+    trap - EXIT INT TERM HUP
+    ssl_cleanup_acme_deploy_stage 2> /dev/null || rc=1
+    if [[ -n "$domain" && -n "$SSL_ACME_BACKUP" ]]; then
+        ssl_rollback_acme_state "$domain" || rc=1
+    fi
+    if [[ -n "$domain" && ( "$SSL_CERT_INSTALL_ACTIVE" == "1" \
+        || "$SSL_CERT_HAD_OLD" == "1" || -n "$SSL_CERT_BACKUP" ) ]]; then
+        ssl_rollback_cert_install "$domain" || rc=1
+    fi
+    if [[ "$SSL_PANEL_ROLLBACK_ACTIVE" == "1" ]]; then
+        if [[ "$SSL_PANEL_ROLLBACK_FORBIDDEN" == "1" ]]; then
+            ssl_log_e "不可逆的证书操作可能已完成；为避免重新启用已吊销或已删除的证书，面板保持 HTTP 回退模式。" \
+                "An irreversible certificate action may have completed; the panel remains in HTTP fallback mode rather than re-enabling a revoked or deleted certificate."
+            ssl_commit_panel_state
+            rc=1
+        elif ssl_restore_panel_state "$SSL_PANEL_OLD_CERT" "$SSL_PANEL_OLD_KEY" \
+            "$SSL_PANEL_OLD_LISTEN" "$SSL_PANEL_OLD_INSECURE"; then
+            ssl_commit_panel_state
+        else
+            rc=1
+        fi
+    fi
+    if [[ -n "$SSL_SCHEDULER_BACKUP" ]]; then
+        ssl_rollback_scheduler_state || rc=1
+    fi
+    ssl_release_lock
+    return "$rc"
+}
+
+ssl_transaction_signal() {
+    local status="$1"
+    [[ "$status" -ne 0 ]] || status=1
+    ssl_transaction_rollback || true
+    exit "$status"
+}
+
+ssl_with_transaction() {
+    local rc=0
+    ssl_acquire_lock || return 1
+    SSL_TRANSACTION_DOMAIN=""
+    trap 'ssl_transaction_signal $?' EXIT
+    trap 'ssl_transaction_signal 130' INT
+    trap 'ssl_transaction_signal 143' TERM HUP
+    "$@" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        ssl_transaction_rollback || rc=1
     else
-        echo -e "${green}\t1.${plain} Get SSL (Domain)"
-        echo -e "${green}\t2.${plain} Revoke"
-        echo -e "${green}\t3.${plain} Force Renew"
-        echo -e "${green}\t4.${plain} Show Existing Domains"
-        echo -e "${green}\t5.${plain} Set Cert paths for the panel"
-        echo -e "${green}\t6.${plain} Get SSL for IP Address (6-day cert, auto-renews)"
-        echo -e "${green}\t0.${plain} Back to Main Menu"
-        read -rp "Choose an option: " choice
+        ssl_commit_transaction_state
+        trap - EXIT INT TERM HUP
+        ssl_release_lock
+    fi
+    return "$rc"
+}
+
+ssl_log_i() {
+    if is_zh; then LOGI "$1"; else LOGI "$2"; fi
+}
+
+ssl_log_e() {
+    if is_zh; then LOGE "$1"; else LOGE "$2"; fi
+}
+
+ssl_is_true() {
+    [[ "${1,,}" == true ]]
+}
+
+ssl_is_ipv4() {
+    local ip="$1" octet
+    local -a octets
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+ssl_normalize_domain() {
+    local domain="$1"
+    domain="${domain#"${domain%%[![:space:]]*}"}"
+    domain="${domain%"${domain##*[![:space:]]}"}"
+    domain="${domain,,}"
+    domain="${domain%.}"
+    printf '%s\n' "$domain"
+}
+
+ssl_valid_domain() {
+    local domain="$1" tld
+    (( ${#domain} >= 4 && ${#domain} <= 253 )) || return 1
+    ssl_is_ipv4 "$domain" && return 1
+    [[ "$domain" != \*.* ]] || return 1
+    [[ "$domain" == *.* ]] || return 1
+    tld="${domain##*.}"
+    (( ${#tld} >= 2 )) && [[ "$tld" =~ [a-z] ]] || return 1
+    [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+ssl_read_domain() {
+    local domain="${1:-}"
+    if [[ -z "$domain" ]]; then
+        if is_zh; then
+            read -rp "请输入要绑定的完整域名（例如 panel.example.com）: " domain
+        else
+            read -rp "Enter the full domain to bind (for example panel.example.com): " domain
+        fi
+    fi
+    domain="$(ssl_normalize_domain "$domain")"
+    if ! ssl_valid_domain "$domain"; then
+        ssl_log_e "域名格式无效：${domain:-<空>}" "Invalid domain: ${domain:-<empty>}"
+        return 1
+    fi
+    SSL_SELECTED_DOMAIN="$domain"
+}
+
+ssl_get_public_ipv4() {
+    local endpoint ip
+    for endpoint in https://api.ipify.org https://4.ident.me https://ipv4.icanhazip.com; do
+        ip=$(curl --noproxy '*' -4fsS --connect-timeout 3 --max-time 6 "$endpoint" 2> /dev/null | tr -d '[:space:]' || true)
+        if ssl_is_ipv4 "$ip"; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ssl_get_public_ipv6() {
+    local ip
+    ip=$(curl --noproxy '*' -6fsS --connect-timeout 3 --max-time 6 https://api64.ipify.org 2> /dev/null | tr -d '[:space:]' || true)
+    [[ "$ip" == *:* ]] || return 1
+    printf '%s\n' "$ip"
+}
+
+ssl_resolve_ipv4() {
+    local domain="$1"
+    if command -v dig > /dev/null 2>&1; then
+        dig +time=3 +tries=1 +short A "$domain" 2> /dev/null | while read -r ip; do
+            ssl_is_ipv4 "$ip" && printf '%s\n' "$ip"
+        done | sort -u
+    elif command -v getent > /dev/null 2>&1; then
+        getent ahostsv4 "$domain" 2> /dev/null | awk '{print $1}' | sort -u
+    elif command -v nslookup > /dev/null 2>&1; then
+        nslookup "$domain" 2> /dev/null | awk '/^Address: / {print $2}' | while read -r ip; do
+            ssl_is_ipv4 "$ip" && printf '%s\n' "$ip"
+        done | sort -u
+    fi
+}
+
+ssl_resolve_ipv6() {
+    local domain="$1"
+    if command -v dig > /dev/null 2>&1; then
+        dig +time=3 +tries=1 +short AAAA "$domain" 2> /dev/null | awk '/:/' | sort -u
+    elif command -v getent > /dev/null 2>&1; then
+        getent ahostsv6 "$domain" 2> /dev/null | awk '{print $1}' | sort -u
+    fi
+}
+
+ssl_dns_check() {
+    local domain="$1" public4 public6 resolved4 resolved6 mismatch=0 matched_family=0
+    public4=$(ssl_get_public_ipv4 || true)
+    public6=$(ssl_get_public_ipv6 || true)
+    resolved4=$(ssl_resolve_ipv4 "$domain")
+    resolved6=$(ssl_resolve_ipv6 "$domain")
+
+    if [[ -z "$resolved4" && -z "$resolved6" ]]; then
+        ssl_log_e "DNS 未找到 ${domain} 的 A/AAAA 记录。请先添加解析并等待生效。" \
+            "No A/AAAA record was found for ${domain}. Add DNS records and wait for propagation."
+        return 1
     fi
 
-    case "$choice" in
-        0)
-            show_menu
-            ;;
-        1)
-            ssl_cert_issue
-            ssl_cert_issue_main
-            ;;
-        2)
-            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
-            if [ -z "$domains" ]; then
-                is_zh && echo "未找到可吊销的的证书。" || echo "No certificates found to revoke."
-            else
-                is_zh && echo "已存在域名:" || echo "Existing domains:"
-                echo "$domains"
-                is_zh && read -rp "请输入列表中要吊销证书的域名: " domain || read -rp "Please enter a domain from the list to revoke the certificate: " domain
-                if echo "$domains" | grep -qw "$domain"; then
-                    ~/.acme.sh/acme.sh --revoke -d ${domain}
-                    is_zh && LOGI "域名 $domain 的证书已吊销。" || LOGI "Certificate revoked for domain: $domain"
-                else
-                    is_zh && echo "输入的域名无效。" || echo "Invalid domain entered."
-                fi
-            fi
-            ssl_cert_issue_main
-            ;;
-        3)
-            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
-            if [ -z "$domains" ]; then
-                is_zh && echo "未找到可更新的证书。" || echo "No certificates found to renew."
-            else
-                is_zh && echo "已存在域名:" || echo "Existing domains:"
-                echo "$domains"
-                is_zh && read -rp "请输入列表中要更新 SSL 证书的域名: " domain || read -rp "Please enter a domain from the list to renew the SSL certificate: " domain
-                if echo "$domains" | grep -qw "$domain"; then
-                    ~/.acme.sh/acme.sh --renew -d ${domain} --force
-                    is_zh && LOGI "域名 $domain 的证书已强制更新。" || LOGI "Certificate forcefully renewed for domain: $domain"
-                else
-                    is_zh && echo "输入的域名无效。" || echo "Invalid domain entered."
-                fi
-            fi
-            ssl_cert_issue_main
-            ;;
-        4)
-            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
-            if [ -z "$domains" ]; then
-                is_zh && echo "未找到任何证书。" || echo "No certificates found."
-            else
-                is_zh && echo "已存在域名及其路径:" || echo "Existing domains and their paths:"
-                for domain in $domains; do
-                    local cert_path="/root/cert/${domain}/fullchain.pem"
-                    local key_path="/root/cert/${domain}/privkey.pem"
-                    if [[ -f "${cert_path}" && -f "${key_path}" ]]; then
-                        echo -e "Domain: ${domain}"
-                        is_zh && echo -e "\t证书路径: ${cert_path}" || echo -e "\tCertificate Path: ${cert_path}"
-                        is_zh && echo -e "\t私钥路径: ${key_path}" || echo -e "\tPrivate Key Path: ${key_path}"
-                    else
-                        is_zh && echo -e "域名: ${domain} - 证书或私钥丢失。" || echo -e "Domain: ${domain} - Certificate or Key missing."
-                    fi
-                done
-            fi
-            ssl_cert_issue_main
-            ;;
-        5)
-            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
-            if [ -z "$domains" ]; then
-                is_zh && echo "未找到任何证书。" || echo "No certificates found."
-            else
-                is_zh && echo "可用域名:" || echo "Available domains:"
-                echo "$domains"
-                is_zh && read -rp "请选择一个域名来设置面板证书路径: " domain || read -rp "Please choose a domain to set the panel paths: " domain
+    is_zh && echo "DNS A 记录: ${resolved4:-无}" || echo "DNS A records: ${resolved4:-none}"
+    is_zh && echo "DNS AAAA 记录: ${resolved6:-无}" || echo "DNS AAAA records: ${resolved6:-none}"
+    is_zh && echo "本机公网 IPv4: ${public4:-未检测到}" || echo "Server public IPv4: ${public4:-not detected}"
+    [[ -z "$public6" ]] || { is_zh && echo "本机公网 IPv6: $public6" || echo "Server public IPv6: $public6"; }
 
-                if echo "$domains" | grep -qw "$domain"; then
-                    local webCertFile="/root/cert/${domain}/fullchain.pem"
-                    local webKeyFile="/root/cert/${domain}/privkey.pem"
+    if [[ -n "$resolved4" ]]; then
+        if [[ -z "$public4" ]] || awk -v expected="$public4" 'NF && $0 != expected {bad=1} END {exit bad ? 0 : 1}' <<< "$resolved4"; then
+            mismatch=1
+        else
+            matched_family=1
+        fi
+    fi
+    if [[ -n "$resolved6" ]]; then
+        if [[ -z "$public6" ]] || awk -v expected="$public6" 'NF && tolower($0) != tolower(expected) {bad=1} END {exit bad ? 0 : 1}' <<< "$resolved6"; then
+            mismatch=1
+        else
+            matched_family=1
+        fi
+    fi
+    if [[ $mismatch -eq 0 && $matched_family -eq 1 ]]; then
+        ssl_log_i "所有 DNS 地址均与本机公网地址一致。" "All DNS addresses match this server's public addresses."
+        return 0
+    fi
 
-                    if [[ -f "${webCertFile}" && -f "${webKeyFile}" ]]; then
-                        ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
-                        ${xui_folder}/x-ui setting -listenIP 0.0.0.0 > /dev/null 2>&1
-                        if is_zh; then
-                            echo "已成功设置域名 $domain 的面板证书路径:"
-                            echo "  - 证书文件: $webCertFile"
-                            echo "  - 私钥文件: $webKeyFile"
-                        else
-                            echo "Panel paths set for domain: $domain"
-                            echo "  - Certificate File: $webCertFile"
-                            echo "  - Private Key File: $webKeyFile"
-                        fi
-                        restart
-                    else
-                        is_zh && echo "未找到域名 $domain 的证书或私钥。" || echo "Certificate or private key not found for domain: $domain."
-                    fi
-                else
-                    is_zh && echo "输入的域名无效。" || echo "Invalid domain entered."
-                fi
-            fi
-            ssl_cert_issue_main
-            ;;
-        6)
-            if is_zh; then
-                echo -e "${yellow}申请 IP 地址的 Let's Encrypt SSL 证书${plain}"
-                echo -e "这将使用短效凭证配置来获取服务器公网 IP 的 SSL 证书。"
-                echo -e "${yellow}证书有效期约为 6 天，通过 acme.sh 定时任务自动续签。${plain}"
-                echo -e "${yellow}注意：TCP 80 端口必须处于开启且可以公开访问的状态。${plain}"
-                confirm "是否继续？" "y"
-            else
-                echo -e "${yellow}Let's Encrypt SSL Certificate for IP Address${plain}"
-                echo -e "This will obtain a certificate for your server's IP using the shortlived profile."
-                echo -e "${yellow}Certificate valid for ~6 days, auto-renews via acme.sh cron job.${plain}"
-                echo -e "${yellow}Port 80 must be open and accessible from the internet.${plain}"
-                confirm "Do you want to proceed?" "y"
-            fi
-            if [[ $? == 0 ]]; then
-                ssl_cert_issue_for_ip
-            fi
-            ssl_cert_issue_main
-            ;;
+    ssl_log_e "至少一个 A/AAAA 记录未指向本机；HTTP-01 可能访问错误服务器。Cloudflare 橙云请使用 DNS 验证。" \
+        "At least one A/AAAA record points elsewhere, so HTTP-01 may reach the wrong server. Use DNS validation for proxied Cloudflare records."
+    if is_zh; then
+        confirm "仍要继续 HTTP-01 验证吗？" "n"
+    else
+        confirm "Continue with HTTP-01 validation anyway?" "n"
+    fi
+}
 
+ssl_install_dependencies() {
+    local need_socat="${1:-0}" missing=0
+    local -a packages=(curl openssl ca-certificates)
+    command -v curl > /dev/null 2>&1 || missing=1
+    command -v openssl > /dev/null 2>&1 || missing=1
+    [[ "$need_socat" != "1" ]] || command -v socat > /dev/null 2>&1 || missing=1
+    [[ $missing -eq 1 ]] || return 0
+    [[ "$need_socat" != "1" ]] || packages+=(socat)
+
+    ssl_log_i "正在安装证书依赖..." "Installing certificate dependencies..."
+    if command -v apt-get > /dev/null 2>&1; then
+        apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || return 1
+    elif command -v dnf > /dev/null 2>&1; then
+        dnf install -y "${packages[@]}" || return 1
+    elif command -v yum > /dev/null 2>&1; then
+        yum install -y "${packages[@]}" || return 1
+    elif command -v apk > /dev/null 2>&1; then
+        apk add --no-cache "${packages[@]}" || return 1
+    elif command -v pacman > /dev/null 2>&1; then
+        pacman -Sy --noconfirm "${packages[@]}" || return 1
+    elif command -v zypper > /dev/null 2>&1; then
+        zypper -n install "${packages[@]}" || return 1
+    else
+        ssl_log_e "无法识别包管理器，请手动安装 curl、openssl 和 socat。" \
+            "Unsupported package manager. Install curl, openssl, and socat manually."
+        return 1
+    fi
+
+    command -v curl > /dev/null 2>&1 && command -v openssl > /dev/null 2>&1 || return 1
+    [[ "$need_socat" != "1" ]] || command -v socat > /dev/null 2>&1
+}
+
+install_acme() {
+    local installer email=""
+    local -a installer_args=(--home "$X_MILI_ACME_HOME")
+    if [[ -x "$X_MILI_ACME_BIN" ]]; then
+        ssl_log_i "acme.sh 已安装。" "acme.sh is already installed."
+        return 0
+    fi
+    ssl_install_dependencies 0 || return 1
+    if is_zh; then
+        read -rp "ACME 账户邮箱（建议填写，可留空）: " email
+    else
+        read -rp "ACME account email (recommended, optional): " email
+    fi
+    if [[ -n "$email" && ! "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        ssl_log_e "邮箱格式无效。" "Invalid email address."
+        return 1
+    fi
+    installer=$(mktemp /tmp/x-mili-acme.XXXXXX) || return 1
+    if ! curl -fsSL --proto '=https' --tlsv1.2 \
+        https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh \
+        -o "$installer"; then
+        rm -f -- "$installer"
+        ssl_log_e "下载 acme.sh 安装器失败。" "Failed to download the acme.sh installer."
+        return 1
+    fi
+    [[ -z "$email" ]] || installer_args+=(--accountemail "$email")
+    installer_args+=(--install-online --nocron)
+    HOME=/root sh "$installer" "${installer_args[@]}"
+    local rc=$?
+    rm -f -- "$installer"
+    if [[ $rc -ne 0 || ! -x "$X_MILI_ACME_BIN" ]]; then
+        ssl_log_e "安装 acme.sh 失败。" "Failed to install acme.sh."
+        return 1
+    fi
+    "$X_MILI_ACME_BIN" --set-default-ca --server letsencrypt > /dev/null || return 1
+    "$X_MILI_ACME_BIN" --upgrade --auto-upgrade > /dev/null 2>&1 || true
+    ssl_log_i "acme.sh 安装完成。" "acme.sh installed successfully."
+}
+
+ssl_service_env_file() {
+    local env_file=""
+    if [[ -f /.dockerenv ]]; then
+        return 1
+    fi
+    if [[ "$release" == alpine && -f /etc/init.d/x-ui ]]; then
+        printf '%s\n' /etc/conf.d/x-ui
+        return 0
+    fi
+    if command -v systemctl > /dev/null 2>&1; then
+        env_file=$(systemctl cat x-ui --no-pager 2> /dev/null \
+            | sed -n 's/^[[:space:]]*EnvironmentFile=[[:space:]]*//p' | tail -n 1)
+        env_file="${env_file#\"}"
+        env_file="${env_file%\"}"
+        env_file="${env_file#-}"
+    fi
+    if [[ -z "$env_file" && -n "${X_MILI_CONFIG_DIR:-}" ]]; then
+        env_file="${X_MILI_CONFIG_DIR}/x-mili.env"
+    fi
+    [[ -n "$env_file" ]] || { [[ -f /etc/x-mili/x-mili.env ]] && env_file=/etc/x-mili/x-mili.env; }
+    [[ -n "$env_file" ]] || env_file=/etc/default/x-ui
+    printf '%s\n' "$env_file"
+}
+
+ssl_insecure_http_enabled() {
+    local env_file value
+    if [[ -f /.dockerenv ]]; then
+        ssl_is_true "${XUI_ALLOW_INSECURE_HTTP:-}"
+        return
+    fi
+    env_file=$(ssl_service_env_file) || return 1
+    [[ -f "$env_file" ]] || return 1
+    value=$(awk -F= '
+        /^[[:space:]]*(export[[:space:]]+)?XUI_ALLOW_INSECURE_HTTP[[:space:]]*=/ {
+            v=$0; sub(/^[^=]*=/, "", v); gsub(/[[:space:]"'"'"']/, "", v); last=tolower(v)
+        }
+        END { print last }
+    ' "$env_file")
+    [[ "$value" == "true" ]]
+}
+
+ssl_ensure_systemd_env_file() {
+    local env_file="$1" dropin_dir dropin tmp
+    [[ -f /.dockerenv || "$release" == alpine ]] && return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl cat x-ui --no-pager 2>/dev/null | grep -q '^[[:space:]]*EnvironmentFile='; then
+        return 0
+    fi
+    dropin_dir=/etc/systemd/system/x-ui.service.d
+    dropin="${dropin_dir}/10-x-mili-env.conf"
+    mkdir -p "$dropin_dir" || return 1
+    tmp=$(mktemp "${dropin}.XXXXXX") || return 1
+    printf '[Service]\nEnvironmentFile=-%s\n' "$env_file" > "$tmp"
+    chown root:root "$tmp" 2>/dev/null || true
+    chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dropin" || return 1
+    systemctl daemon-reload
+}
+
+ssl_write_docker_http_mode() {
+    local enabled="$1" data_dir marker tmp
+    data_dir="${XUI_DB_FOLDER:-/etc/x-ui}"
+    marker="${data_dir}/.x-mili-http-mode"
+    mkdir -p "$data_dir" || return 1
+    tmp=$(mktemp "${marker}.XXXXXX") || return 1
+    printf '%s\n' "$enabled" > "$tmp"
+    chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$marker"
+}
+
+ssl_set_insecure_http() {
+    local enabled="$1" env_file tmp parent
+    if [[ -f /.dockerenv ]]; then
+        # Docker cannot mutate PID 1's inherited environment.  Persist the
+        # requested state in the shared DB volume; the host `ml ssl` wrapper
+        # consumes it, updates Compose, and force-recreates the container.
+        ssl_write_docker_http_mode "$enabled" || return 1
+        if [[ "$enabled" == "true" ]] && ! ssl_insecure_http_enabled; then
+            ssl_log_i "已请求宿主机重建容器以开启临时公网 HTTP。" \
+                "Requested a host-side container recreate for temporary public HTTP."
+        elif [[ "$enabled" != "true" ]] && ssl_insecure_http_enabled; then
+            ssl_log_i "已请求宿主机重建容器并移除公网明文 HTTP 开关。" \
+                "Requested a host-side container recreate with public plaintext HTTP disabled."
+        fi
+        return 0
+    fi
+
+    env_file=$(ssl_service_env_file) || return 1
+    parent=$(dirname "$env_file")
+    mkdir -p "$parent" || return 1
+    tmp=$(mktemp "${env_file}.XXXXXX") || return 1
+    if [[ -f "$env_file" ]]; then
+        sed '/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}XUI_ALLOW_INSECURE_HTTP[[:space:]]*=/d' "$env_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    fi
+    if [[ "$enabled" == "true" ]]; then
+        if [[ "$env_file" == /etc/conf.d/* ]]; then
+            printf 'export XUI_ALLOW_INSECURE_HTTP=true\n' >> "$tmp"
+        else
+            printf 'XUI_ALLOW_INSECURE_HTTP=true\n' >> "$tmp"
+        fi
+    fi
+    chown root:root "$tmp" 2> /dev/null || true
+    chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$env_file" || return 1
+    ssl_ensure_systemd_env_file "$env_file"
+}
+
+ssl_panel_cert() {
+    "${xui_folder}/x-ui" setting -getCert true 2> /dev/null | sed -n 's/^cert:[[:space:]]*//p' | sed -n '1p'
+}
+
+ssl_panel_key() {
+    "${xui_folder}/x-ui" setting -getCert true 2> /dev/null | sed -n 's/^key:[[:space:]]*//p' | sed -n '1p'
+}
+
+ssl_panel_listen() {
+    "${xui_folder}/x-ui" setting -getListen true 2> /dev/null | sed -n 's/^listenIP:[[:space:]]*//p' | sed -n '1p'
+}
+
+ssl_set_panel_cert() {
+    local cert="$1" key="$2"
+    "${xui_folder}/x-ui" cert -webCert "$cert" -webCertKey "$key" > /dev/null 2>&1 || return 1
+    [[ "$(ssl_panel_cert)" == "$cert" && "$(ssl_panel_key)" == "$key" ]]
+}
+
+ssl_set_panel_listen() {
+    local listen="$1"
+    "${xui_folder}/x-ui" setting -listenIP "$listen" > /dev/null 2>&1 || return 1
+    [[ "$(ssl_panel_listen)" == "$listen" ]]
+}
+
+ssl_panel_setting() {
+    local key="$1"
+    "${xui_folder}/x-ui" setting -show true 2> /dev/null \
+        | awk -v key="$key" '$1 == key ":" {print $2; exit}'
+}
+
+ssl_panel_port() {
+    local port
+    port=$(ssl_panel_setting port)
+    [[ "$port" =~ ^[0-9]+$ ]] || port=2053
+    printf '%s\n' "$port"
+}
+
+ssl_panel_path() {
+    local path
+    path=$(ssl_panel_setting webBasePath)
+    [[ -n "$path" ]] || path=/
+    [[ "$path" == /* ]] || path="/$path"
+    [[ "$path" == */ ]] || path="$path/"
+    printf '%s\n' "$path"
+}
+
+ssl_verify_cert_key_pair() {
+    local domain="$1" cert="$2" key="$3" cert_pub key_pub
+    [[ -s "$cert" && -s "$key" ]] || return 1
+    openssl x509 -in "$cert" -noout > /dev/null 2>&1 || return 1
+    openssl pkey -in "$key" -noout > /dev/null 2>&1 || return 1
+    cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2> /dev/null \
+        | openssl pkey -pubin -outform DER 2> /dev/null | openssl dgst -sha256 2> /dev/null) || return 1
+    key_pub=$(openssl pkey -in "$key" -pubout -outform DER 2> /dev/null \
+        | openssl dgst -sha256 2> /dev/null) || return 1
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || return 1
+    if openssl x509 -help 2>&1 | grep -q -- '-checkhost'; then
+        openssl x509 -in "$cert" -noout -checkhost "$domain" > /dev/null 2>&1 || return 1
+    fi
+}
+
+ssl_verify_cert_files() {
+    local domain="$1" cert="$2" key="$3"
+    ssl_verify_cert_key_pair "$domain" "$cert" "$key" || return 1
+    openssl x509 -in "$cert" -noout -checkend 60 > /dev/null 2>&1
+}
+
+ssl_verify_local_https() {
+    local domain="$1" port path i
+    port=$(ssl_panel_port)
+    path=$(ssl_panel_path)
+    for i in {1..12}; do
+        if curl --noproxy '*' -sS --output /dev/null --connect-timeout 3 --max-time 8 \
+            --resolve "${domain}:${port}:127.0.0.1" "https://${domain}:${port}${path}" 2> /dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+ssl_verify_local_http() {
+    local port path i
+    port=$(ssl_panel_port)
+    path=$(ssl_panel_path)
+    for i in {1..10}; do
+        curl --noproxy '*' -sS --output /dev/null --connect-timeout 2 --max-time 5 \
+            "http://127.0.0.1:${port}${path}" 2> /dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+ssl_public_listener_active() {
+    local port="$1"
+    command -v ss > /dev/null 2>&1 || return 0
+    ss -ltnH 2> /dev/null | awk -v p=":${port}$" '
+        $4 ~ p && ($4 ~ /^0\.0\.0\.0:/ || $4 ~ /^\[::\]:/ || $4 ~ /^\*:/) {found=1}
+        END {exit !found}'
+}
+
+ssl_commit_panel_state() {
+    # Clear all panel rollback metadata at one trap boundary. Call this only
+    # when the enclosing certificate transaction is committed, or when an
+    # irreversible action makes restoring the old TLS state unsafe.
+    SSL_PANEL_ROLLBACK_ACTIVE=0 SSL_PANEL_ROLLBACK_FORBIDDEN=0 \
+        SSL_PANEL_OLD_CERT="" SSL_PANEL_OLD_KEY="" SSL_PANEL_OLD_LISTEN="" \
+        SSL_PANEL_OLD_INSECURE=false
+}
+
+ssl_commit_transaction_state() {
+    local cert_backup="$SSL_CERT_BACKUP" acme_backup="$SSL_ACME_BACKUP"
+    local scheduler_backup="$SSL_SCHEDULER_BACKUP" backup
+
+    # This is the sole successful transaction commit point. All rollback
+    # eligibility is cleared by one assignment-only simple command, which is a
+    # single Bash trap boundary. Backup deletion happens only afterwards.
+    SSL_CERT_BACKUP="" SSL_CERT_HAD_OLD=0 SSL_CERT_INSTALL_ACTIVE=0 \
+        SSL_ACME_BACKUP="" SSL_ACME_HAD_RSA=0 SSL_ACME_HAD_ECC=0 \
+        SSL_ACME_HAD_ACCOUNT=0 SSL_ACME_SNAPSHOT_COMPLETE=0 \
+        SSL_PANEL_ROLLBACK_ACTIVE=0 SSL_PANEL_ROLLBACK_FORBIDDEN=0 \
+        SSL_PANEL_OLD_CERT="" SSL_PANEL_OLD_KEY="" SSL_PANEL_OLD_LISTEN="" \
+        SSL_PANEL_OLD_INSECURE=false SSL_SCHEDULER_BACKUP="" \
+        SSL_SCHEDULER_SNAPSHOT_COMPLETE=0 SSL_SCHEDULER_MODE="" \
+        SSL_SCHEDULER_HAD_CRONTAB=0 SSL_SCHEDULER_HAD_SERVICE=0 \
+        SSL_SCHEDULER_HAD_TIMER=0 SSL_SCHEDULER_TIMER_ENABLED=0 \
+        SSL_SCHEDULER_TIMER_ACTIVE=0 SSL_SCHEDULER_CROND_ENABLED=0 \
+        SSL_SCHEDULER_CROND_ACTIVE=0 SSL_SCHEDULER_SYSTEMD_DIR="" \
+        SSL_SCHEDULER_DOCKER_MARKER=""
+
+    for backup in "$cert_backup" "$acme_backup" "$scheduler_backup"; do
+        [[ -z "$backup" ]] || rm -rf -- "$backup" 2> /dev/null || true
+    done
+}
+
+ssl_restore_panel_state() {
+    local cert="$1" key="$2" listen="$3" insecure="$4" rc=0
+    [[ -n "$listen" ]] || listen=0.0.0.0
+    ssl_set_panel_cert "$cert" "$key" || rc=1
+    ssl_set_panel_listen "$listen" || rc=1
+    ssl_set_insecure_http "$insecure" > /dev/null 2>&1 || rc=1
+    restart 0 > /dev/null 2>&1 || rc=1
+    if [[ $rc -ne 0 ]]; then
+        ssl_log_e "自动恢复未完全成功，请立即检查面板证书、监听地址和服务日志。" \
+            "Automatic rollback was incomplete; inspect panel certificate paths, listener settings, and service logs immediately."
+    fi
+    return "$rc"
+}
+
+ssl_apply_panel_tls() {
+    local domain="$1" cert="$2" key="$3"
+    local old_cert old_key old_listen old_insecure=false port
+    ssl_verify_cert_files "$domain" "$cert" "$key" || {
+        ssl_log_e "证书或私钥校验失败，未修改面板。" "Certificate/key validation failed; the panel was not changed."
+        return 1
+    }
+    port=$(ssl_panel_port)
+    ssl_prepare_panel_firewall "$port" || return 1
+    old_cert=$(ssl_panel_cert)
+    old_key=$(ssl_panel_key)
+    old_listen=$(ssl_panel_listen)
+    ssl_insecure_http_enabled && old_insecure=true
+    SSL_PANEL_OLD_CERT="$old_cert"
+    SSL_PANEL_OLD_KEY="$old_key"
+    SSL_PANEL_OLD_LISTEN="$old_listen"
+    SSL_PANEL_OLD_INSECURE="$old_insecure"
+    SSL_PANEL_ROLLBACK_ACTIVE=1
+
+    # Clear the plaintext override first. A later broken certificate must never
+    # fall back to a public HTTP listener.
+    if ! ssl_set_insecure_http false \
+        || ! ssl_set_panel_cert "$cert" "$key" \
+        || ! ssl_set_panel_listen 0.0.0.0 \
+        || ! restart 0 \
+        || ! ssl_verify_local_https "$domain"; then
+        ssl_log_e "HTTPS 启用或本机握手验证失败，正在恢复原配置。" \
+            "HTTPS activation or local handshake failed; restoring the previous configuration."
+        ssl_restore_panel_state "$old_cert" "$old_key" "$old_listen" "$old_insecure" \
+            && ssl_commit_panel_state
+        return 1
+    fi
+
+    ssl_log_i "HTTPS 已启用并通过本机 TLS 验证。" "HTTPS is enabled and passed the local TLS probe."
+    echo -e "${green}https://${domain}:$(ssl_panel_port)$(ssl_panel_path)${plain}"
+}
+
+ssl_acme_mode() {
+    local domain="$1"
+    if [[ -d "${X_MILI_ACME_HOME}/${domain}_ecc" ]]; then
+        echo ecc
+    elif [[ -d "${X_MILI_ACME_HOME}/${domain}" ]]; then
+        echo rsa
+    else
+        echo none
+    fi
+}
+
+ssl_backup_acme_state() {
+    local domain="$1"
+    SSL_TRANSACTION_DOMAIN="$domain"
+    mkdir -p "$X_MILI_CERT_ROOT" "$X_MILI_ACME_HOME" || return 1
+    SSL_ACME_BACKUP="" SSL_ACME_HAD_RSA=0 SSL_ACME_HAD_ECC=0 \
+        SSL_ACME_HAD_ACCOUNT=0 SSL_ACME_SNAPSHOT_COMPLETE=0
+    SSL_ACME_BACKUP=$(mktemp -d "${X_MILI_CERT_ROOT}/.acme-state.${domain}.XXXXXX") || return 1
+    if [[ -f "${X_MILI_ACME_HOME}/account.conf" ]]; then
+        cp -a -- "${X_MILI_ACME_HOME}/account.conf" "${SSL_ACME_BACKUP}/account.conf" \
+            || { ssl_commit_acme_state; return 1; }
+        SSL_ACME_HAD_ACCOUNT=1
+    fi
+    if [[ -d "${X_MILI_ACME_HOME}/${domain}" ]]; then
+        cp -a -- "${X_MILI_ACME_HOME}/${domain}" "${SSL_ACME_BACKUP}/rsa" \
+            || { ssl_commit_acme_state; return 1; }
+        SSL_ACME_HAD_RSA=1
+    fi
+    if [[ -d "${X_MILI_ACME_HOME}/${domain}_ecc" ]]; then
+        cp -a -- "${X_MILI_ACME_HOME}/${domain}_ecc" "${SSL_ACME_BACKUP}/ecc" \
+            || { ssl_commit_acme_state; return 1; }
+        SSL_ACME_HAD_ECC=1
+    fi
+    # A rollback may touch live ACME state only after every expected item was
+    # copied and its presence flag was recorded.
+    SSL_ACME_SNAPSHOT_COMPLETE=1
+}
+
+ssl_commit_acme_state() {
+    local backup="$SSL_ACME_BACKUP"
+    # Clear rollback eligibility as one simple command before deleting the
+    # snapshot. A signal can then leave only an orphaned backup, never make a
+    # later rollback operate from a missing or partial snapshot.
+    SSL_ACME_BACKUP="" SSL_ACME_HAD_RSA=0 SSL_ACME_HAD_ECC=0 \
+        SSL_ACME_HAD_ACCOUNT=0 SSL_ACME_SNAPSHOT_COMPLETE=0
+    [[ -z "$backup" ]] || rm -rf -- "$backup"
+}
+
+ssl_rollback_acme_state() {
+    local domain="$1" rsa_stage="" ecc_stage="" account_stage=""
+    [[ -n "$SSL_ACME_BACKUP" && -d "$SSL_ACME_BACKUP" ]] || return 1
+    if [[ "$SSL_ACME_SNAPSHOT_COMPLETE" != "1" ]]; then
+        # Snapshot creation is read-only. If it was interrupted, discard only
+        # the partial snapshot and leave all live ACME files untouched.
+        ssl_commit_acme_state
+        return 0
+    fi
+    if [[ $SSL_ACME_HAD_RSA -eq 1 ]]; then
+        rsa_stage="${X_MILI_ACME_HOME}/.${domain}.restore-rsa.$$"
+        rm -rf -- "$rsa_stage"
+        cp -a -- "${SSL_ACME_BACKUP}/rsa" "$rsa_stage" || {
+            ssl_log_e "恢复旧 ACME RSA 状态失败，备份保留在 ${SSL_ACME_BACKUP}。" \
+                "Failed to stage the old RSA ACME state; backup kept at ${SSL_ACME_BACKUP}."
+            return 1
+        }
+    fi
+    if [[ $SSL_ACME_HAD_ECC -eq 1 ]]; then
+        ecc_stage="${X_MILI_ACME_HOME}/.${domain}.restore-ecc.$$"
+        rm -rf -- "$ecc_stage"
+        cp -a -- "${SSL_ACME_BACKUP}/ecc" "$ecc_stage" || {
+            [[ -z "$rsa_stage" ]] || rm -rf -- "$rsa_stage"
+            ssl_log_e "恢复旧 ACME ECC 状态失败，备份保留在 ${SSL_ACME_BACKUP}。" \
+                "Failed to stage the old ECC ACME state; backup kept at ${SSL_ACME_BACKUP}."
+            return 1
+        }
+    fi
+    if [[ $SSL_ACME_HAD_ACCOUNT -eq 1 ]]; then
+        account_stage="${X_MILI_ACME_HOME}/.account.conf.restore.$$"
+        rm -f -- "$account_stage"
+        cp -a -- "${SSL_ACME_BACKUP}/account.conf" "$account_stage" || {
+            [[ -z "$rsa_stage" ]] || rm -rf -- "$rsa_stage"
+            [[ -z "$ecc_stage" ]] || rm -rf -- "$ecc_stage"
+            ssl_log_e "恢复旧 ACME account.conf 失败，备份保留在 ${SSL_ACME_BACKUP}。" \
+                "Failed to stage the old ACME account.conf; backup kept at ${SSL_ACME_BACKUP}."
+            return 1
+        }
+    fi
+    rm -rf -- "${X_MILI_ACME_HOME:?}/${domain}" "${X_MILI_ACME_HOME:?}/${domain}_ecc"
+    [[ -z "$rsa_stage" ]] || mv -- "$rsa_stage" "${X_MILI_ACME_HOME}/${domain}" || return 1
+    [[ -z "$ecc_stage" ]] || mv -- "$ecc_stage" "${X_MILI_ACME_HOME}/${domain}_ecc" || return 1
+    rm -f -- "${X_MILI_ACME_HOME}/account.conf"
+    [[ -z "$account_stage" ]] || mv -- "$account_stage" "${X_MILI_ACME_HOME}/account.conf" || return 1
+    ssl_commit_acme_state
+}
+
+ssl_cleanup_acme_deploy_stage() {
+    [[ -z "$SSL_ACME_DEPLOY_STAGE" ]] || rm -rf -- "$SSL_ACME_DEPLOY_STAGE"
+    SSL_ACME_DEPLOY_STAGE=""
+}
+
+ssl_prepare_acme_deploy_stage() {
+    local domain="$1" mode conf stage tmp reload_b64
+    ssl_cleanup_acme_deploy_stage
+    mode=$(ssl_acme_mode "$domain")
+    [[ "$mode" != none ]] || return 0
+    mkdir -p "$X_MILI_CERT_ROOT" || return 1
+    stage=$(mktemp -d "${X_MILI_CERT_ROOT}/.${domain}.acme-deploy.XXXXXX") || return 1
+    if [[ "$mode" == ecc ]]; then
+        conf="${X_MILI_ACME_HOME}/${domain}_ecc/${domain}.conf"
+    else
+        conf="${X_MILI_ACME_HOME}/${domain}/${domain}.conf"
+    fi
+    [[ -f "$conf" ]] || { rm -rf -- "$stage"; return 1; }
+    reload_b64=$(printf '%s' /bin/true | openssl base64 -A 2> /dev/null) || {
+        rm -rf -- "$stage"
+        return 1
+    }
+    tmp=$(mktemp "${conf}.x-mili.XXXXXX") || { rm -rf -- "$stage"; return 1; }
+    if ! sed \
+        -e '/^Le_RealCertPath[[:space:]]*=/d' \
+        -e '/^Le_RealCACertPath[[:space:]]*=/d' \
+        -e '/^Le_RealKeyPath[[:space:]]*=/d' \
+        -e '/^Le_ReloadCmd[[:space:]]*=/d' \
+        -e '/^Le_RealFullChainPath[[:space:]]*=/d' \
+        "$conf" > "$tmp"; then
+        rm -f -- "$tmp"
+        rm -rf -- "$stage"
+        return 1
+    fi
+    {
+        printf "Le_RealCertPath='%s'\n" "${stage}/cert.pem"
+        printf "Le_RealCACertPath='%s'\n" "${stage}/ca.pem"
+        printf "Le_RealKeyPath='%s'\n" "${stage}/privkey.pem"
+        printf "Le_ReloadCmd='__ACME_BASE64__START_%s__ACME_BASE64__END_'\n" "$reload_b64"
+        printf "Le_RealFullChainPath='%s'\n" "${stage}/fullchain.pem"
+    } >> "$tmp"
+    chmod 0600 "$tmp" || { rm -f -- "$tmp"; rm -rf -- "$stage"; return 1; }
+    if ! mv -f -- "$tmp" "$conf" \
+        || [[ $(grep -Fc "$stage" "$conf" 2> /dev/null) -lt 4 ]] \
+        || ! grep -Fq "Le_ReloadCmd='__ACME_BASE64__START_${reload_b64}__ACME_BASE64__END_'" "$conf"; then
+        rm -f -- "$tmp"
+        rm -rf -- "$stage"
+        ssl_log_e "无法确认 ACME 安全部署路径，已中止。" \
+            "Could not verify the safe ACME deployment paths; aborting."
+        return 1
+    fi
+    SSL_ACME_DEPLOY_STAGE="$stage"
+}
+
+ssl_scheduler_path_is_safe() {
+    # These paths are embedded in both a systemd unit and a crontab command.
+    # Keep the accepted alphabet shell- and unit-safe instead of attempting to
+    # compose two different escaping formats for privileged renewal jobs.
+    [[ "$1" =~ ^/[A-Za-z0-9._/+:~-]+$ ]]
+}
+
+ssl_commit_scheduler_state() {
+    local backup="$SSL_SCHEDULER_BACKUP"
+    SSL_SCHEDULER_BACKUP="" SSL_SCHEDULER_SNAPSHOT_COMPLETE=0 \
+        SSL_SCHEDULER_MODE="" SSL_SCHEDULER_HAD_CRONTAB=0 \
+        SSL_SCHEDULER_HAD_SERVICE=0 SSL_SCHEDULER_HAD_TIMER=0 \
+        SSL_SCHEDULER_TIMER_ENABLED=0 SSL_SCHEDULER_TIMER_ACTIVE=0 \
+        SSL_SCHEDULER_CROND_ENABLED=0 SSL_SCHEDULER_CROND_ACTIVE=0 \
+        SSL_SCHEDULER_SYSTEMD_DIR="" SSL_SCHEDULER_DOCKER_MARKER=""
+    [[ -z "$backup" ]] || rm -rf -- "$backup"
+}
+
+ssl_backup_scheduler_state() {
+    local mode="$1" backup systemd_dir service_file timer_file marker
+    [[ -z "$SSL_SCHEDULER_BACKUP" ]] || return 1
+    mkdir -p "$X_MILI_CERT_ROOT" || return 1
+    backup=$(mktemp -d "${X_MILI_CERT_ROOT}/.scheduler-state.XXXXXX") || return 1
+    SSL_SCHEDULER_BACKUP="$backup" SSL_SCHEDULER_SNAPSHOT_COMPLETE=0 \
+        SSL_SCHEDULER_MODE="$mode" SSL_SCHEDULER_HAD_CRONTAB=0 \
+        SSL_SCHEDULER_HAD_SERVICE=0 SSL_SCHEDULER_HAD_TIMER=0 \
+        SSL_SCHEDULER_TIMER_ENABLED=0 SSL_SCHEDULER_TIMER_ACTIVE=0 \
+        SSL_SCHEDULER_CROND_ENABLED=0 SSL_SCHEDULER_CROND_ACTIVE=0 \
+        SSL_SCHEDULER_SYSTEMD_DIR="" SSL_SCHEDULER_DOCKER_MARKER=""
+
+    if command -v crontab > /dev/null 2>&1 \
+        && crontab -l > "${backup}/crontab" 2> /dev/null; then
+        SSL_SCHEDULER_HAD_CRONTAB=1
+    fi
+
+    case "$mode" in
+        systemd)
+            systemd_dir="${X_MILI_SYSTEMD_DIR:-/etc/systemd/system}"
+            service_file="${systemd_dir}/x-mili-acme-renew.service"
+            timer_file="${systemd_dir}/x-mili-acme-renew.timer"
+            SSL_SCHEDULER_SYSTEMD_DIR="$systemd_dir"
+            if [[ -e "$service_file" || -L "$service_file" ]]; then
+                cp -a -- "$service_file" "${backup}/service" \
+                    || { ssl_commit_scheduler_state; return 1; }
+                SSL_SCHEDULER_HAD_SERVICE=1
+            fi
+            if [[ -e "$timer_file" || -L "$timer_file" ]]; then
+                cp -a -- "$timer_file" "${backup}/timer" \
+                    || { ssl_commit_scheduler_state; return 1; }
+                SSL_SCHEDULER_HAD_TIMER=1
+            fi
+            systemctl is-enabled --quiet x-mili-acme-renew.timer 2> /dev/null \
+                && SSL_SCHEDULER_TIMER_ENABLED=1
+            systemctl is-active --quiet x-mili-acme-renew.timer 2> /dev/null \
+                && SSL_SCHEDULER_TIMER_ACTIVE=1
+            ;;
+        cron)
+            if command -v rc-update > /dev/null 2>&1 \
+                && rc-update show default 2> /dev/null \
+                    | grep -Eq '(^|[[:space:]])crond([[:space:]]|$)'; then
+                SSL_SCHEDULER_CROND_ENABLED=1
+            fi
+            if command -v rc-service > /dev/null 2>&1 \
+                && rc-service crond status > /dev/null 2>&1; then
+                SSL_SCHEDULER_CROND_ACTIVE=1
+            fi
+            ;;
+        docker)
+            marker="${XUI_DB_FOLDER:-/etc/x-ui}/.x-mili-acme-renewal"
+            SSL_SCHEDULER_DOCKER_MARKER="$marker"
+            if [[ -e "$marker" || -L "$marker" ]]; then
+                cp -a -- "$marker" "${backup}/docker-marker" \
+                    || { ssl_commit_scheduler_state; return 1; }
+            fi
+            ;;
         *)
-            is_zh && echo -e "${red}无效选项。请选择正确的数字。${plain}\n" || echo -e "${red}Invalid option. Please select a valid number.${plain}\n"
-            ssl_cert_issue_main
+            ssl_commit_scheduler_state
+            return 1
             ;;
     esac
+    SSL_SCHEDULER_SNAPSHOT_COMPLETE=1
 }
 
-ssl_cert_issue_for_ip() {
-    LOGI "Starting automatic SSL certificate generation for server IP..."
-    LOGI "Using Let's Encrypt shortlived profile (~6 days validity, auto-renews)"
+ssl_restore_scheduler_crontab() {
+    local backup="$SSL_SCHEDULER_BACKUP"
+    command -v crontab > /dev/null 2>&1 || {
+        [[ $SSL_SCHEDULER_HAD_CRONTAB -eq 0 ]]
+        return
+    }
+    if [[ $SSL_SCHEDULER_HAD_CRONTAB -eq 1 ]]; then
+        crontab "${backup}/crontab"
+    else
+        crontab -r > /dev/null 2>&1 || ! crontab -l > /dev/null 2>&1
+    fi
+}
 
-    local existing_webBasePath=$(${xui_folder}/x-ui setting -show true | grep -Eo 'webBasePath: .+' | awk '{print $2}')
-    local existing_port=$(${xui_folder}/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
-
-    # Get server IP
-    local server_ip=$(curl -s --max-time 3 https://api.ipify.org)
-    if [ -z "$server_ip" ]; then
-        server_ip=$(curl -s --max-time 3 https://4.ident.me)
+ssl_rollback_scheduler_state() {
+    local backup="$SSL_SCHEDULER_BACKUP" rc=0 systemd_dir service_file timer_file marker
+    [[ -n "$backup" && -d "$backup" ]] || return 1
+    if [[ "$SSL_SCHEDULER_SNAPSHOT_COMPLETE" != "1" ]]; then
+        ssl_commit_scheduler_state
+        return 0
     fi
 
-    if [ -z "$server_ip" ]; then
-        LOGE "Failed to get server IP address"
+    case "$SSL_SCHEDULER_MODE" in
+        systemd)
+            systemd_dir="$SSL_SCHEDULER_SYSTEMD_DIR"
+            service_file="${systemd_dir}/x-mili-acme-renew.service"
+            timer_file="${systemd_dir}/x-mili-acme-renew.timer"
+            systemctl disable --now x-mili-acme-renew.timer > /dev/null 2>&1 || true
+            if [[ $SSL_SCHEDULER_HAD_SERVICE -eq 1 ]]; then
+                rm -f -- "$service_file" || rc=1
+                cp -a -- "${backup}/service" "$service_file" || rc=1
+            else
+                rm -f -- "$service_file" || rc=1
+            fi
+            if [[ $SSL_SCHEDULER_HAD_TIMER -eq 1 ]]; then
+                rm -f -- "$timer_file" || rc=1
+                cp -a -- "${backup}/timer" "$timer_file" || rc=1
+            else
+                rm -f -- "$timer_file" || rc=1
+            fi
+            systemctl daemon-reload > /dev/null 2>&1 || rc=1
+            if [[ $SSL_SCHEDULER_HAD_TIMER -eq 1 ]]; then
+                if [[ $SSL_SCHEDULER_TIMER_ENABLED -eq 1 ]]; then
+                    systemctl enable x-mili-acme-renew.timer > /dev/null 2>&1 || rc=1
+                else
+                    systemctl disable x-mili-acme-renew.timer > /dev/null 2>&1 || rc=1
+                fi
+                if [[ $SSL_SCHEDULER_TIMER_ACTIVE -eq 1 ]]; then
+                    systemctl start x-mili-acme-renew.timer > /dev/null 2>&1 || rc=1
+                else
+                    systemctl stop x-mili-acme-renew.timer > /dev/null 2>&1 || rc=1
+                fi
+            fi
+            ;;
+        cron)
+            if command -v rc-update > /dev/null 2>&1 \
+                && command -v rc-service > /dev/null 2>&1; then
+                if [[ $SSL_SCHEDULER_CROND_ENABLED -eq 1 ]]; then
+                    rc-update add crond default > /dev/null 2>&1 || rc=1
+                else
+                    rc-update del crond default > /dev/null 2>&1 || true
+                fi
+                if [[ $SSL_SCHEDULER_CROND_ACTIVE -eq 1 ]]; then
+                    rc-service crond start > /dev/null 2>&1 || rc=1
+                else
+                    rc-service crond stop > /dev/null 2>&1 || true
+                fi
+            fi
+            ;;
+        docker)
+            marker="$SSL_SCHEDULER_DOCKER_MARKER"
+            if [[ -e "${backup}/docker-marker" || -L "${backup}/docker-marker" ]]; then
+                rm -f -- "$marker" || rc=1
+                cp -a -- "${backup}/docker-marker" "$marker" || rc=1
+            else
+                rm -f -- "$marker" || rc=1
+            fi
+            ;;
+        *) rc=1 ;;
+    esac
+
+    ssl_restore_scheduler_crontab || rc=1
+    if [[ $rc -eq 0 ]]; then
+        ssl_commit_scheduler_state
+    else
+        ssl_log_e "自动续签调度器回滚不完整，快照保留在 ${backup}。" \
+            "Renewal scheduler rollback was incomplete; snapshot kept at ${backup}."
+    fi
+    return "$rc"
+}
+
+ssl_acme_native_cron_present() {
+    command -v crontab > /dev/null 2>&1 || return 1
+    crontab -l 2> /dev/null | awk -v bin="$X_MILI_ACME_BIN" -v home="$X_MILI_ACME_HOME" '
+        index($0, "--cron") && (index($0, bin) || index($0, home "/acme.sh")) {found=1}
+        END {exit !found}
+    '
+}
+
+ssl_install_cron_renewal() {
+    local cron_tmp
+    command -v crontab > /dev/null 2>&1 || return 1
+    cron_tmp=$(mktemp /tmp/x-mili-acme-cron.XXXXXX) || return 1
+    crontab -l 2> /dev/null | sed -e '\|/usr/bin/ml ssl cron|d' > "$cron_tmp" || true
+    printf '17 3 * * * X_MILI_ACME_HOME=%s X_MILI_CERT_ROOT=%s /usr/bin/ml ssl cron >/dev/null 2>&1 # X-MILI managed renewal\n' \
+        "$X_MILI_ACME_HOME" "$X_MILI_CERT_ROOT" >> "$cron_tmp"
+    if ! crontab "$cron_tmp"; then
+        rm -f -- "$cron_tmp"
+        return 1
+    fi
+    rm -f -- "$cron_tmp"
+    crontab -l 2> /dev/null | grep -Fq '/usr/bin/ml ssl cron' || return 1
+    if command -v rc-update > /dev/null 2>&1 && command -v rc-service > /dev/null 2>&1; then
+        rc-update add crond default > /dev/null 2>&1 || return 1
+        rc-service crond start > /dev/null 2>&1 \
+            || rc-service crond status > /dev/null 2>&1 || return 1
+    elif command -v pgrep > /dev/null 2>&1; then
+        pgrep -x cron > /dev/null 2>&1 || pgrep -x crond > /dev/null 2>&1 || return 1
+    else
+        return 1
+    fi
+}
+
+ssl_install_systemd_renew_timer() {
+    local systemd_dir="${X_MILI_SYSTEMD_DIR:-/etc/systemd/system}"
+    local service_file="${systemd_dir}/x-mili-acme-renew.service"
+    local timer_file="${systemd_dir}/x-mili-acme-renew.timer"
+    local service_tmp timer_tmp
+    if ! ssl_scheduler_path_is_safe "$X_MILI_ACME_HOME" \
+        || ! ssl_scheduler_path_is_safe "$X_MILI_CERT_ROOT"; then
+        ssl_log_e "ACME 或证书目录包含不适合特权续签任务的字符。" \
+            "The ACME or certificate directory contains characters unsafe for a privileged renewal job."
+        return 1
+    fi
+    mkdir -p "$systemd_dir" || return 1
+    service_tmp=$(mktemp "${service_file}.XXXXXX") || return 1
+    timer_tmp=$(mktemp "${timer_file}.XXXXXX") || { rm -f -- "$service_tmp"; return 1; }
+    cat > "$service_tmp" <<EOF
+[Unit]
+Description=X-MILI ACME certificate renewal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment="X_MILI_ACME_HOME=${X_MILI_ACME_HOME}"
+Environment="X_MILI_CERT_ROOT=${X_MILI_CERT_ROOT}"
+UMask=0077
+ExecStart=/usr/bin/ml ssl cron
+EOF
+    cat > "$timer_tmp" <<'EOF'
+[Unit]
+Description=Daily X-MILI ACME certificate renewal
+
+[Timer]
+OnActiveSec=15min
+OnUnitActiveSec=24h
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+    chown root:root "$service_tmp" "$timer_tmp" 2> /dev/null || true
+    chmod 0644 "$service_tmp" "$timer_tmp" \
+        || { rm -f -- "$service_tmp" "$timer_tmp"; return 1; }
+    mv -f -- "$service_tmp" "$service_file" \
+        && mv -f -- "$timer_tmp" "$timer_file" \
+        || { rm -f -- "$service_tmp" "$timer_tmp"; return 1; }
+    systemctl daemon-reload \
+        && systemctl enable --now x-mili-acme-renew.timer > /dev/null \
+        && systemctl is-enabled --quiet x-mili-acme-renew.timer \
+        && systemctl is-active --quiet x-mili-acme-renew.timer
+}
+
+ssl_write_docker_renewal_marker() {
+    local data_dir marker tmp
+    data_dir="${XUI_DB_FOLDER:-/etc/x-ui}"
+    marker="${data_dir}/.x-mili-acme-renewal"
+    mkdir -p "$data_dir" || return 1
+    tmp=$(mktemp "${marker}.XXXXXX") || return 1
+    printf 'true\n' > "$tmp"
+    chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$marker"
+}
+
+ssl_configure_auto_renew() {
+    local mode configured=0
+    if ! ssl_scheduler_path_is_safe "$X_MILI_ACME_HOME" \
+        || ! ssl_scheduler_path_is_safe "$X_MILI_CERT_ROOT"; then
+        ssl_log_e "ACME 或证书目录包含不适合特权续签任务的字符。" \
+            "The ACME or certificate directory contains characters unsafe for a privileged renewal job."
         return 1
     fi
 
-    LOGI "Server IP detected: ${server_ip}"
+    if [[ -f /.dockerenv ]]; then
+        mode=docker
+    elif command -v systemctl > /dev/null 2>&1 \
+        && systemctl show x-ui > /dev/null 2>&1; then
+        mode=systemd
+    else
+        command -v crontab > /dev/null 2>&1 || return 1
+        mode=cron
+    fi
 
-    # Ask for optional IPv6
-    local ipv6_addr=""
-    read -rp "Do you have an IPv6 address to include? (leave empty to skip): " ipv6_addr
-    ipv6_addr="${ipv6_addr// /}" # Trim whitespace
+    ssl_backup_scheduler_state "$mode" || return 1
+    case "$mode" in
+        docker) ssl_write_docker_renewal_marker && configured=1 ;;
+        systemd) ssl_install_systemd_renew_timer && configured=1 ;;
+        cron) ssl_install_cron_renewal && configured=1 ;;
+    esac
+    if [[ $configured -ne 1 ]]; then
+        ssl_rollback_scheduler_state || true
+        return 1
+    fi
 
-    # check for acme.sh first
-    if ! command -v ~/.acme.sh/acme.sh &> /dev/null; then
-        LOGI "acme.sh not found, installing..."
-        install_acme
-        if [ $? -ne 0 ]; then
-            LOGE "Failed to install acme.sh"
+    # The prior native acme.sh cron remains present until the replacement has
+    # been installed and verified. Docker's host-side recreate reconstructs
+    # the container crontab, so it performs this handoff outside the container.
+    if [[ "$mode" != docker ]] && ssl_acme_native_cron_present; then
+        "$X_MILI_ACME_BIN" --home "$X_MILI_ACME_HOME" --uninstall-cronjob > /dev/null 2>&1 || true
+        if ssl_acme_native_cron_present; then
+            ssl_log_e "新续签调度器已安装，但无法安全移除旧 acme.sh cron；正在回滚调度器。" \
+                "The replacement scheduler was installed, but the old acme.sh cron could not be removed safely; rolling the scheduler back."
+            ssl_rollback_scheduler_state || true
             return 1
         fi
     fi
+    if [[ "$mode" == cron ]] \
+        && ! crontab -l 2> /dev/null | grep -Fq '/usr/bin/ml ssl cron'; then
+        ssl_rollback_scheduler_state || true
+        return 1
+    fi
 
-    # install socat
-    case "${release}" in
-        ubuntu | debian | armbian)
-            apt-get update > /dev/null 2>&1 && apt-get install socat -y > /dev/null 2>&1
-            ;;
-        fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-            dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
-            ;;
-        centos)
-            if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                yum -y update > /dev/null 2>&1 && yum -y install socat > /dev/null 2>&1
-            else
-                dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
-            fi
-            ;;
-        arch | manjaro | parch)
-            pacman -Sy --noconfirm socat > /dev/null 2>&1
-            ;;
-        opensuse-tumbleweed | opensuse-leap)
-            zypper refresh > /dev/null 2>&1 && zypper -q install -y socat > /dev/null 2>&1
-            ;;
-        alpine)
-            apk add socat curl openssl > /dev/null 2>&1
+    case "$mode" in
+        docker) SSL_RENEWAL_MODE=docker-host ;;
+        systemd) SSL_RENEWAL_MODE=systemd ;;
+        cron) SSL_RENEWAL_MODE=cron ;;
+    esac
+}
+
+ssl_install_acme_cert() {
+    local domain="$1" mode source_dir source_key source_fullchain stage dest backup="" reload_cmd
+    local -a ecc_arg=()
+    mode=$(ssl_acme_mode "$domain")
+    [[ "$mode" != none ]] || {
+        ssl_log_e "acme.sh 中没有 ${domain} 的签发记录。" "No acme.sh issuance record exists for ${domain}."
+        return 1
+    }
+    [[ "$mode" != ecc ]] || ecc_arg=(--ecc)
+    if [[ "$mode" == ecc ]]; then
+        source_dir="${X_MILI_ACME_HOME}/${domain}_ecc"
+    else
+        source_dir="${X_MILI_ACME_HOME}/${domain}"
+    fi
+    source_key="${source_dir}/${domain}.key"
+    source_fullchain="${source_dir}/fullchain.cer"
+    if [[ ! -s "$source_key" || ! -s "$source_fullchain" ]]; then
+        ssl_log_e "acme.sh 源证书或私钥不存在。" "The acme.sh source certificate or key is missing."
+        return 1
+    fi
+    mkdir -p "$X_MILI_CERT_ROOT" || return 1
+    stage=$(mktemp -d "${X_MILI_CERT_ROOT}/.${domain}.new.XXXXXX") || return 1
+    dest="${X_MILI_CERT_ROOT}/${domain}"
+
+    if ! cp -- "$source_key" "${stage}/privkey.pem" \
+        || ! cp -- "$source_fullchain" "${stage}/fullchain.pem"; then
+        rm -rf -- "$stage"
+        ssl_log_e "无法复制 acme.sh 源证书。" "Failed to copy the acme.sh source certificate."
+        return 1
+    fi
+    if ! ssl_verify_cert_files "$domain" "${stage}/fullchain.pem" "${stage}/privkey.pem"; then
+        rm -rf -- "$stage"
+        ssl_log_e "新证书校验失败，旧证书未改动。" "The new certificate failed validation; the old certificate is untouched."
+        return 1
+    fi
+    chmod 0600 "${stage}/privkey.pem"
+    chmod 0644 "${stage}/fullchain.pem"
+
+    SSL_CERT_BACKUP="" SSL_CERT_HAD_OLD=0 SSL_CERT_INSTALL_ACTIVE=0
+    if [[ -e "$dest" || -L "$dest" ]] && { [[ ! -d "$dest" ]] || [[ -L "$dest" ]]; }; then
+        rm -rf -- "$stage"
+        ssl_log_e "证书目标不是安全的实体目录，已中止替换。" \
+            "The certificate destination is not a safe physical directory; replacement was aborted."
+        return 1
+    fi
+    if [[ -d "$dest" ]]; then
+        backup="${X_MILI_CERT_ROOT}/.${domain}.old.$(date +%s).$$"
+        SSL_CERT_BACKUP="$backup" SSL_CERT_HAD_OLD=1 SSL_CERT_INSTALL_ACTIVE=1
+        if ! mv -- "$dest" "$backup"; then
+            SSL_CERT_BACKUP="" SSL_CERT_HAD_OLD=0 SSL_CERT_INSTALL_ACTIVE=0
+            rm -rf -- "$stage"
+            return 1
+        fi
+    else
+        SSL_CERT_INSTALL_ACTIVE=1
+    fi
+    if ! mv -- "$stage" "$dest"; then
+        ssl_rollback_cert_install "$domain" || true
+        return 1
+    fi
+
+    # acme.sh must never reload the panel outside this transaction. The panel
+    # is applied, restarted, and probed only after certificate validation.
+    reload_cmd=/bin/true
+    if ! "$X_MILI_ACME_BIN" --install-cert -d "$domain" "${ecc_arg[@]}" \
+        --key-file "${dest}/privkey.pem" \
+        --fullchain-file "${dest}/fullchain.pem" \
+        --reloadcmd "$reload_cmd" \
+        || ! ssl_verify_cert_files "$domain" "${dest}/fullchain.pem" "${dest}/privkey.pem"; then
+        ssl_rollback_cert_install "$domain" || true
+        ssl_log_e "安装新证书失败，已恢复旧证书。" "Failed to install the new certificate; the old certificate was restored."
+        return 1
+    fi
+}
+
+ssl_commit_cert_install() {
+    local backup="$SSL_CERT_BACKUP"
+    # Make the committed destination ineligible for rollback before removing
+    # its old backup. These assignments form one trap boundary in Bash.
+    SSL_CERT_BACKUP="" SSL_CERT_HAD_OLD=0 SSL_CERT_INSTALL_ACTIVE=0
+    [[ -z "$backup" ]] || rm -rf -- "$backup"
+}
+
+ssl_restore_cert_snapshot() {
+    local domain="$1" snapshot="$2" dest displaced
+    dest="${X_MILI_CERT_ROOT}/${domain}"
+    displaced="${X_MILI_CERT_ROOT}/.${domain}.restore-displaced.$(date +%s).$$"
+    if [[ ! -d "$snapshot" ]] \
+        || ! ssl_verify_cert_key_pair "$domain" "${snapshot}/fullchain.pem" "${snapshot}/privkey.pem"; then
+        ssl_log_e "旧证书快照无效，未覆盖当前文件：${snapshot}" \
+            "The old certificate snapshot is invalid; current files were not replaced: ${snapshot}"
+        return 1
+    fi
+    if [[ -e "$dest" ]]; then
+        mv -- "$dest" "$displaced" || return 1
+    else
+        displaced=""
+    fi
+    if ! mv -- "$snapshot" "$dest"; then
+        [[ -z "$displaced" ]] || mv -- "$displaced" "$dest" 2> /dev/null || true
+        ssl_log_e "恢复旧证书失败，快照仍保留在 ${snapshot}。" \
+            "Failed to restore the old certificate; snapshot remains at ${snapshot}."
+        return 1
+    fi
+    if ! ssl_verify_cert_key_pair "$domain" "${dest}/fullchain.pem" "${dest}/privkey.pem"; then
+        mv -- "$dest" "$snapshot" 2> /dev/null || true
+        [[ -z "$displaced" ]] || mv -- "$displaced" "$dest" 2> /dev/null || true
+        ssl_log_e "恢复后的证书校验失败，快照保留在 ${snapshot}。" \
+            "The restored certificate failed validation; snapshot kept at ${snapshot}."
+        return 1
+    fi
+    [[ -z "$displaced" ]] || rm -rf -- "$displaced"
+    ssl_commit_cert_install
+}
+
+ssl_rollback_cert_install() {
+    local domain="$1" dest
+    dest="${X_MILI_CERT_ROOT}/${domain}"
+    if [[ "$SSL_CERT_INSTALL_ACTIVE" != "1" && "$SSL_CERT_HAD_OLD" != "1" \
+        && -z "$SSL_CERT_BACKUP" ]]; then
+        return 0
+    fi
+    if [[ $SSL_CERT_HAD_OLD -eq 1 && -n "$SSL_CERT_BACKUP" && -d "$SSL_CERT_BACKUP" ]]; then
+        ssl_restore_cert_snapshot "$domain" "$SSL_CERT_BACKUP"
+        return
+    fi
+    if [[ $SSL_CERT_HAD_OLD -eq 1 ]]; then
+        # The rollback state is published immediately before the atomic move
+        # of the old destination. If the move had not happened when a signal
+        # arrived, the original destination is still authoritative.
+        if [[ -d "$dest" && -n "$SSL_CERT_BACKUP" && ! -e "$SSL_CERT_BACKUP" ]]; then
+            SSL_CERT_BACKUP="" SSL_CERT_HAD_OLD=0 SSL_CERT_INSTALL_ACTIVE=0
+            return 0
+        fi
+        return 1
+    fi
+    rm -rf -- "$dest" || return 1
+    SSL_CERT_BACKUP="" SSL_CERT_HAD_OLD=0 SSL_CERT_INSTALL_ACTIVE=0
+}
+
+ssl_finish_issue() {
+    local domain="$1" cert key
+    if ! ssl_install_acme_cert "$domain"; then
+        return 1
+    fi
+    cert="${X_MILI_CERT_ROOT}/${domain}/fullchain.pem"
+    key="${X_MILI_CERT_ROOT}/${domain}/privkey.pem"
+    if ! ssl_configure_auto_renew; then
+        ssl_log_e "无法安装并验证自动续签调度，正在恢复旧证书。" \
+            "Could not install and verify the renewal scheduler; restoring the old certificate."
+        ssl_rollback_cert_install "$domain"
+        restart 0 > /dev/null 2>&1 || true
+        return 1
+    fi
+    if ! ssl_apply_panel_tls "$domain" "$cert" "$key"; then
+        ssl_rollback_cert_install "$domain"
+        restart 0 > /dev/null 2>&1 || true
+        return 1
+    fi
+    "$X_MILI_ACME_BIN" --upgrade --auto-upgrade > /dev/null 2>&1 || true
+    if [[ "${SSL_RENEWAL_MODE:-}" == docker-host ]]; then
+        ssl_log_i "证书已保存；宿主机将根据共享标记安装自动续签任务。" \
+            "Certificate saved; the host will install renewal scheduling from the shared marker."
+    else
+        ssl_log_i "证书已保存到 ${X_MILI_CERT_ROOT}/${domain}，自动续签调度已验证。" \
+            "Certificate saved in ${X_MILI_CERT_ROOT}/${domain}; renewal scheduling was verified."
+    fi
+}
+
+ssl_show_port_owner() {
+    local port="$1"
+    if command -v ss > /dev/null 2>&1; then
+        ss -ltnpH 2> /dev/null | awk -v p=":${port}$" '$4 ~ p'
+    elif command -v lsof > /dev/null 2>&1; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN 2> /dev/null || true
+    fi
+}
+
+ssl_ufw_port_rule_exists() {
+    local port="$1" status
+    status=$(LC_ALL=C ufw status 2> /dev/null) || return 1
+    awk -v plain="$port" -v tcp="${port}/tcp" '
+        ($1 == plain || $1 == tcp) && $2 == "ALLOW" && $3 == "Anywhere" {found=1}
+        END {exit !found}
+    ' <<< "$status"
+}
+
+ssl_ufw_http_rule_exists() {
+    ssl_ufw_port_rule_exists 80
+}
+
+ssl_prepare_http01_firewall() {
+    local ufw_status zone auto_open="${X_MILI_AUTO_OPEN_FIREWALL:-true}"
+    local runtime_open=0 permanent_open=0 changed=0 active=0
+
+    ssl_log_i "脚本只能配置主机防火墙；云平台安全组/云防火墙仍需手动放行公网 TCP 80。" \
+        "Only the host firewall can be configured here; allow public TCP 80 manually in the cloud security group/firewall."
+
+    case "${auto_open,,}" in
+        1|true|yes|on) ;;
+        0|false|no|off)
+            ssl_log_i "已关闭自动防火墙修改；请手动确认 TCP 80。" \
+                "Automatic firewall changes are disabled; verify TCP 80 manually."
+            return 0
             ;;
         *)
-            LOGW "Unsupported OS for automatic socat installation"
+            ssl_log_e "X_MILI_AUTO_OPEN_FIREWALL 必须是 1/true/yes/on 或 0/false/no/off；未修改防火墙。" \
+                "X_MILI_AUTO_OPEN_FIREWALL must be 1/true/yes/on or 0/false/no/off; no firewall change was made."
+            return 1
             ;;
     esac
 
-    # Create certificate directory
-    certPath="/root/cert/ip"
-    mkdir -p "$certPath"
-
-    # Build domain arguments
-    local domain_args="-d ${server_ip}"
-    if [[ -n "$ipv6_addr" ]] && is_ipv6 "$ipv6_addr"; then
-        domain_args="${domain_args} -d ${ipv6_addr}"
-        LOGI "Including IPv6 address: ${ipv6_addr}"
-    fi
-
-    # Choose port for HTTP-01 listener (default 80, allow override)
-    local WebPort=""
-    read -rp "Port to use for ACME HTTP-01 listener (default 80): " WebPort
-    WebPort="${WebPort:-80}"
-    if ! [[ "${WebPort}" =~ ^[0-9]+$ ]] || ((WebPort < 1 || WebPort > 65535)); then
-        LOGE "Invalid port provided. Falling back to 80."
-        WebPort=80
-    fi
-    LOGI "Using port ${WebPort} to issue certificate for IP: ${server_ip}"
-    if [[ "${WebPort}" -ne 80 ]]; then
-        LOGI "Reminder: Let's Encrypt still reaches port 80; forward external port 80 to ${WebPort} for validation."
-    fi
-
-    while true; do
-        if is_port_in_use "${WebPort}"; then
-            LOGI "Port ${WebPort} is currently in use."
-
-            local alt_port=""
-            read -rp "Enter another port for acme.sh standalone listener (leave empty to abort): " alt_port
-            alt_port="${alt_port// /}"
-            if [[ -z "${alt_port}" ]]; then
-                LOGE "Port ${WebPort} is busy; cannot proceed with issuance."
-                return 1
+    if command -v ufw > /dev/null 2>&1; then
+        ufw_status=$(LC_ALL=C ufw status 2> /dev/null || true)
+        if grep -Eq '^Status:[[:space:]]*active[[:space:]]*$' <<< "$ufw_status"; then
+            active=1
+            if ssl_ufw_http_rule_exists; then
+                ssl_log_i "UFW 已放行公网 TCP 80，现有规则保持不变。" \
+                    "UFW already allows public TCP 80; the existing rule is unchanged."
+            else
+                if ! ufw allow 80/tcp > /dev/null \
+                    || ! ssl_ufw_http_rule_exists; then
+                    ssl_log_e "UFW TCP 80 规则添加或验证失败，已中止 HTTP-01。" \
+                        "Failed to add or verify the UFW TCP 80 rule; HTTP-01 was aborted."
+                    return 1
+                fi
+                changed=1
+                ssl_log_i "UFW 已持久放行 TCP 80，规则将保留供自动续签使用。" \
+                    "UFW now allows TCP 80; the rule is kept for automatic renewal."
             fi
-            if ! [[ "${alt_port}" =~ ^[0-9]+$ ]] || ((alt_port < 1 || alt_port > 65535)); then
-                LOGE "Invalid port provided."
-                return 1
-            fi
-            WebPort="${alt_port}"
-            continue
-        else
-            LOGI "Port ${WebPort} is free and ready for standalone validation."
-            break
         fi
-    done
-
-    # Reload command - restarts panel after renewal
-    local reloadCmd="systemctl restart x-ui 2>/dev/null || rc-service x-ui restart 2>/dev/null"
-
-    # issue the certificate for IP with shortlived profile
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt --force
-    ~/.acme.sh/acme.sh --issue \
-        ${domain_args} \
-        --standalone \
-        --server letsencrypt \
-        --certificate-profile shortlived \
-        --days 6 \
-        --httpport ${WebPort} \
-        --force
-
-    if [ $? -ne 0 ]; then
-        LOGE "Failed to issue certificate for IP: ${server_ip}"
-        LOGE "Make sure port ${WebPort} is open and the server is accessible from the internet"
-        # Cleanup acme.sh data for both IPv4 and IPv6 if specified
-        rm -rf ~/.acme.sh/${server_ip} 2> /dev/null
-        [[ -n "$ipv6_addr" ]] && rm -rf ~/.acme.sh/${ipv6_addr} 2> /dev/null
-        rm -rf ${certPath} 2> /dev/null
-        return 1
-    else
-        LOGI "Certificate issued successfully for IP: ${server_ip}"
     fi
 
-    # Install the certificate
-    # Note: acme.sh may report "Reload error" and exit non-zero if reloadcmd fails,
-    # but the cert files are still installed. We check for files instead of exit code.
-    ~/.acme.sh/acme.sh --installcert -d ${server_ip} \
-        --key-file "${certPath}/privkey.pem" \
-        --fullchain-file "${certPath}/fullchain.pem" \
-        --reloadcmd "${reloadCmd}" 2>&1 || true
-
-    # Verify certificate files exist (don't rely on exit code - reloadcmd failure causes non-zero)
-    if [[ ! -f "${certPath}/fullchain.pem" || ! -f "${certPath}/privkey.pem" ]]; then
-        LOGE "Certificate files not found after installation"
-        # Cleanup acme.sh data for both IPv4 and IPv6 if specified
-        rm -rf ~/.acme.sh/${server_ip} 2> /dev/null
-        [[ -n "$ipv6_addr" ]] && rm -rf ~/.acme.sh/${ipv6_addr} 2> /dev/null
-        rm -rf ${certPath} 2> /dev/null
-        return 1
+    if command -v firewall-cmd > /dev/null 2>&1 \
+        && [[ "$(firewall-cmd --state 2> /dev/null || true)" == running ]]; then
+        active=1
+        zone=$(firewall-cmd --get-default-zone 2> /dev/null || true)
+        if [[ ! "$zone" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            ssl_log_e "无法安全确定 firewalld 默认 zone，已中止 HTTP-01。" \
+                "Could not safely determine the firewalld default zone; HTTP-01 was aborted."
+            return 1
+        fi
+        if firewall-cmd --quiet --zone="$zone" --query-port=80/tcp \
+            || firewall-cmd --quiet --zone="$zone" --query-service=http; then
+            runtime_open=1
+        fi
+        if firewall-cmd --quiet --permanent --zone="$zone" --query-port=80/tcp \
+            || firewall-cmd --quiet --permanent --zone="$zone" --query-service=http; then
+            permanent_open=1
+        fi
+        if [[ $permanent_open -eq 0 ]]; then
+            firewall-cmd --quiet --permanent --zone="$zone" --add-port=80/tcp || {
+                ssl_log_e "firewalld 持久 TCP 80 规则添加失败，已中止 HTTP-01。" \
+                    "Failed to add the permanent firewalld TCP 80 rule; HTTP-01 was aborted."
+                return 1
+            }
+            changed=1
+        fi
+        if [[ $runtime_open -eq 0 ]]; then
+            firewall-cmd --quiet --zone="$zone" --add-port=80/tcp || {
+                ssl_log_e "firewalld 运行时 TCP 80 规则添加失败，已中止 HTTP-01。" \
+                    "Failed to add the runtime firewalld TCP 80 rule; HTTP-01 was aborted."
+                return 1
+            }
+            changed=1
+        fi
+        if ! { firewall-cmd --quiet --zone="$zone" --query-port=80/tcp \
+                || firewall-cmd --quiet --zone="$zone" --query-service=http; } \
+            || ! { firewall-cmd --quiet --permanent --zone="$zone" --query-port=80/tcp \
+                || firewall-cmd --quiet --permanent --zone="$zone" --query-service=http; }; then
+            ssl_log_e "firewalld TCP 80 规则验证失败，已中止 HTTP-01。" \
+                "Failed to verify the firewalld TCP 80 rule; HTTP-01 was aborted."
+            return 1
+        fi
+        if [[ $runtime_open -eq 1 && $permanent_open -eq 1 ]]; then
+            ssl_log_i "firewalld zone ${zone} 已放行 TCP 80，现有规则保持不变。" \
+                "firewalld zone ${zone} already allows TCP 80; existing rules are unchanged."
+        else
+            ssl_log_i "firewalld zone ${zone} 已放行运行时和持久 TCP 80，规则将保留供自动续签使用。" \
+                "firewalld zone ${zone} now allows runtime and permanent TCP 80; the rule is kept for automatic renewal."
+        fi
     fi
 
-    LOGI "Certificate files installed successfully"
+    if [[ $active -eq 0 ]]; then
+        ssl_log_i "未检测到活动的 UFW/firewalld；未修改主机防火墙。" \
+            "No active UFW/firewalld was detected; no host firewall change was made."
+    elif [[ $changed -eq 0 ]]; then
+        : # Existing rules were deliberately left untouched.
+    fi
+}
 
-    # enable auto-renew
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade > /dev/null 2>&1
-    chmod 600 $certPath/privkey.pem 2> /dev/null
-    chmod 644 $certPath/fullchain.pem 2> /dev/null
+ssl_firewalld_port_rule_exists() {
+    local port="$1" zone="$2" scope="${3:-runtime}"
+    local -a args=(--quiet --zone="$zone")
+    [[ "$scope" != permanent ]] || args=(--quiet --permanent --zone="$zone")
+    firewall-cmd "${args[@]}" --query-port="${port}/tcp" \
+        || { [[ "$port" == 80 ]] && firewall-cmd "${args[@]}" --query-service=http; }
+}
 
-    # Set certificate paths for the panel
-    local webCertFile="${certPath}/fullchain.pem"
-    local webKeyFile="${certPath}/privkey.pem"
+ssl_prepare_panel_firewall() {
+    local port="$1" auto_open="${X_MILI_AUTO_OPEN_FIREWALL:-true}"
+    local ufw_status zone runtime_open=0 permanent_open=0
+    [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || {
+        ssl_log_e "面板端口无效，未修改防火墙。" \
+            "The panel port is invalid; no firewall change was made."
+        return 1
+    }
+    ssl_log_i "脚本只能配置主机防火墙；云安全组/云防火墙仍需手动放行公网 TCP ${port}。" \
+        "Only the host firewall can be configured here; allow public TCP ${port} manually in the cloud security group/firewall."
+    case "${auto_open,,}" in
+        1|true|yes|on) ;;
+        0|false|no|off)
+            ssl_log_i "已关闭自动防火墙修改；请手动确认面板端口 TCP ${port}。" \
+                "Automatic firewall changes are disabled; verify panel TCP ${port} manually."
+            return 0
+            ;;
+        *)
+            ssl_log_e "X_MILI_AUTO_OPEN_FIREWALL 必须是 1/true/yes/on 或 0/false/no/off；未修改防火墙。" \
+                "X_MILI_AUTO_OPEN_FIREWALL must be 1/true/yes/on or 0/false/no/off; no firewall change was made."
+            return 1
+            ;;
+    esac
 
-    if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
-        ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
-        ${xui_folder}/x-ui setting -listenIP 0.0.0.0 > /dev/null 2>&1
-        LOGI "Certificate configured for panel"
-        LOGI "  - Certificate File: $webCertFile"
-        LOGI "  - Private Key File: $webKeyFile"
-        LOGI "  - Validity: ~6 days (auto-renews via acme.sh cron)"
-        echo -e "${green}Access URL: https://${server_ip}:${existing_port}${existing_webBasePath}${plain}"
-        LOGI "Panel will restart to apply SSL certificate..."
-        restart
-        return 0
-    else
-        LOGE "Certificate files not found after installation"
+    if command -v ufw > /dev/null 2>&1; then
+        ufw_status=$(LC_ALL=C ufw status 2> /dev/null || true)
+        if grep -Eq '^Status:[[:space:]]*active[[:space:]]*$' <<< "$ufw_status" \
+            && ! ssl_ufw_port_rule_exists "$port"; then
+            if ! ufw allow "${port}/tcp" > /dev/null \
+                || ! ssl_ufw_port_rule_exists "$port"; then
+                ssl_log_e "UFW TCP ${port} 规则添加或验证失败，未启用公网 TLS。" \
+                    "Failed to add or verify the UFW TCP ${port} rule; public TLS was not enabled."
+                return 1
+            fi
+        fi
+    fi
+
+    if command -v firewall-cmd > /dev/null 2>&1 \
+        && [[ "$(firewall-cmd --state 2> /dev/null || true)" == running ]]; then
+        zone=$(firewall-cmd --get-default-zone 2> /dev/null || true)
+        [[ "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || {
+            ssl_log_e "无法安全确定 firewalld 默认 zone，未启用公网 TLS。" \
+                "Could not safely determine the firewalld default zone; public TLS was not enabled."
+            return 1
+        }
+        ssl_firewalld_port_rule_exists "$port" "$zone" runtime && runtime_open=1
+        ssl_firewalld_port_rule_exists "$port" "$zone" permanent && permanent_open=1
+        if [[ $permanent_open -eq 0 ]]; then
+            firewall-cmd --quiet --permanent --zone="$zone" --add-port="${port}/tcp" || return 1
+        fi
+        if [[ $runtime_open -eq 0 ]]; then
+            firewall-cmd --quiet --zone="$zone" --add-port="${port}/tcp" || return 1
+        fi
+        ssl_firewalld_port_rule_exists "$port" "$zone" runtime \
+            && ssl_firewalld_port_rule_exists "$port" "$zone" permanent || {
+            ssl_log_e "firewalld TCP ${port} 规则验证失败，未启用公网 TLS。" \
+                "Failed to verify the firewalld TCP ${port} rule; public TLS was not enabled."
+            return 1
+        }
+    fi
+}
+
+ssl_prepare_webroot() {
+    local domain="$1" webroot="${2:-}" resolved challenge token body
+    if [[ -z "$webroot" ]]; then
+        if is_zh; then
+            read -rp "请输入现有 Web 服务器的网站根目录（例如 /var/www/html）: " webroot
+        else
+            read -rp "Enter the existing web server document root (for example /var/www/html): " webroot
+        fi
+    fi
+    [[ -d "$webroot" ]] || { ssl_log_e "目录不存在。" "Directory does not exist."; return 1; }
+    resolved=$(cd "$webroot" 2> /dev/null && pwd -P) || return 1
+    case "$resolved" in
+        /|/root|/etc|/home|/usr|/var)
+            ssl_log_e "拒绝把敏感系统目录作为 ACME webroot。" "Refusing to use a sensitive system directory as ACME webroot."
+            return 1
+            ;;
+    esac
+    is_port_in_use 80 || {
+        ssl_log_e "Webroot 模式需要已有 Web 服务器监听 TCP 80。" "Webroot mode requires an existing web server on TCP 80."
+        return 1
+    }
+    challenge="${resolved}/.well-known/acme-challenge"
+    mkdir -p "$challenge" || return 1
+    token="x-mili-$RANDOM-$$"
+    printf '%s' "$token" > "${challenge}/${token}" || return 1
+    body=$(curl --noproxy '*' -fsSL --connect-timeout 4 --max-time 10 "http://${domain}/.well-known/acme-challenge/${token}" 2> /dev/null || true)
+    rm -f -- "${challenge}/${token}"
+    if [[ "$body" != "$token" ]]; then
+        ssl_log_e "公网 Webroot 自检失败；域名/80 端口/网站目录至少一项不正确。" \
+            "Public webroot self-test failed; DNS, port 80, or the document root is incorrect."
         return 1
     fi
+    SSL_WEBROOT="$resolved"
 }
 
 ssl_cert_issue() {
-    local existing_webBasePath=$(${xui_folder}/x-ui setting -show true | grep -Eo 'webBasePath: .+' | awk '{print $2}')
-    local existing_port=$(${xui_folder}/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
-    # check for acme.sh first
-    if ! command -v ~/.acme.sh/acme.sh &> /dev/null; then
-        is_zh && echo "未找到 acme.sh。我们现在开始安装它。" || echo "acme.sh could not be found. we will install it"
-        install_acme
-        if [ $? -ne 0 ]; then
-            is_zh && LOGE "安装 acme 失败，请检查日志。" || LOGE "install acme failed, please check logs"
-            exit 1
-        fi
-    fi
+    local requested_domain="${1:-}" requested_method="${2:-}" requested_webroot="${3:-}"
+    local domain method cert_keylength=ec-256
+    local -a issue_args
+    ssl_read_domain "$requested_domain" || return 1
+    domain="$SSL_SELECTED_DOMAIN"
+    ssl_install_dependencies 0 || return 1
+    ssl_dns_check "$domain" || return 1
+    install_acme || return 1
+    ssl_backup_acme_state "$domain" || return 1
+    [[ "$(ssl_acme_mode "$domain")" != rsa ]] || cert_keylength=2048
 
-    # install socat
-    case "${release}" in
-        ubuntu | debian | armbian)
-            apt-get update > /dev/null 2>&1 && apt-get install socat -y > /dev/null 2>&1
-            ;;
-        fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-            dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
-            ;;
-        centos)
-            if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                yum -y update > /dev/null 2>&1 && yum -y install socat > /dev/null 2>&1
+    case "${requested_method,,}" in
+        standalone) method=1 ;;
+        webroot) method=2 ;;
+        "")
+            if is_zh; then
+                echo -e "${green}1.${plain} Standalone（推荐，要求 80 端口空闲）"
+                echo -e "${green}2.${plain} Webroot（已有 Nginx/Caddy/Apache 占用 80）"
+                read -rp "验证方式 [1]: " method
             else
-                dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
+                echo -e "${green}1.${plain} Standalone (recommended; port 80 must be free)"
+                echo -e "${green}2.${plain} Webroot (an existing web server owns port 80)"
+                read -rp "Validation method [1]: " method
             fi
-            ;;
-        arch | manjaro | parch)
-            pacman -Sy --noconfirm socat > /dev/null 2>&1
-            ;;
-        opensuse-tumbleweed | opensuse-leap)
-            zypper refresh > /dev/null 2>&1 && zypper -q install -y socat > /dev/null 2>&1
-            ;;
-        alpine)
-            apk add socat curl openssl > /dev/null 2>&1
             ;;
         *)
-            is_zh && LOGW "不支持的系统，无法自动安装 socat" || LOGW "Unsupported OS for automatic socat installation"
+            ssl_log_e "验证方式只能是 standalone 或 webroot。" "Validation method must be standalone or webroot."
+            ssl_commit_acme_state
+            return 1
             ;;
     esac
-    if [ $? -ne 0 ]; then
-        is_zh && LOGE "安装 socat 失败，请检查日志。" || LOGE "install socat failed, please check logs"
-        exit 1
-    else
-        is_zh && LOGI "安装 socat 成功..." || LOGI "install socat succeed..."
+    if [[ -z "$requested_method" ]]; then
+        method="${method:-1}"
     fi
-
-    # get the domain here, and we need to verify it
-    local domain=""
-    while true; do
-        is_zh && read -rp "请输入您的域名: " domain || read -rp "Please enter your domain name: " domain
-        domain="${domain// /}" # Trim whitespace
-
-        if [[ -z "$domain" ]]; then
-            is_zh && LOGE "域名不能为空，请重试。" || LOGE "Domain name cannot be empty. Please try again."
-            continue
-        fi
-
-        if ! is_domain "$domain"; then
-            is_zh && LOGE "域名格式无效: ${domain}。请重新输入。" || LOGE "Invalid domain format: ${domain}. Please enter a valid domain name."
-            continue
-        fi
-
-        break
-    done
-    is_zh && LOGD "您的域名为: ${domain}，正在检查..." || LOGD "Your domain is: ${domain}, checking it..."
-    SSL_ISSUED_DOMAIN="${domain}"
-
-    # detect existing certificate and reuse it if present
-    local cert_exists=0
-    if ~/.acme.sh/acme.sh --list 2> /dev/null | awk '{print $1}' | grep -Fxq "${domain}"; then
-        cert_exists=1
-        local certInfo=$(~/.acme.sh/acme.sh --list 2> /dev/null | grep -F "${domain}")
-        is_zh && LOGI "发现 ${domain} 已有证书，将复用它。" || LOGI "Existing certificate found for ${domain}, will reuse it."
-        [[ -n "${certInfo}" ]] && LOGI "${certInfo}"
-    else
-        is_zh && LOGI "您的域名准备好申请证书了..." || LOGI "Your domain is ready for issuing certificates now..."
-    fi
-
-    # create a directory for the certificate
-    certPath="/root/cert/${domain}"
-    if [ ! -d "$certPath" ]; then
-        mkdir -p "$certPath"
-    else
-        rm -rf "$certPath"
-        mkdir -p "$certPath"
-    fi
-
-    # get the port number for the standalone server
-    local WebPort=80
-    is_zh && read -rp "请选择使用的端口 (默认 80): " WebPort || read -rp "Please choose which port to use (default is 80): " WebPort
-    if [[ ${WebPort} -gt 65535 || ${WebPort} -lt 1 ]]; then
-        is_zh && LOGE "输入的端口 ${WebPort} 无效，将使用默认的 80 端口。" || LOGE "Your input ${WebPort} is invalid, will use default port 80."
-        WebPort=80
-    fi
-    is_zh && LOGI "将使用端口: ${WebPort} 进行证书签发，请确保该端口已开启。" || LOGI "Will use port: ${WebPort} to issue certificates. Please make sure this port is open."
-
-    if [[ ${cert_exists} -eq 0 ]]; then
-        # issue the certificate
-        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt --force
-        ~/.acme.sh/acme.sh --issue -d ${domain} --listen-v6 --standalone --httpport ${WebPort} --force
-        if [ $? -ne 0 ]; then
-            is_zh && LOGE "签发证书失败，请检查日志。" || LOGE "Issuing certificate failed, please check logs."
-            rm -rf ~/.acme.sh/${domain}
-            exit 1
-        else
-            is_zh && LOGI "签发证书成功，正在安装证书..." || LOGE "Issuing certificate succeeded, installing certificates..."
-        fi
-    else
-        is_zh && LOGI "使用已有证书，正在安装..." || LOGI "Using existing certificate, installing certificates..."
-    fi
-
-    reloadCmd="ml restart"
-
-    if is_zh; then
-        LOGI "ACME 的默认重载命令 --reloadcmd 为: ${yellow}ml restart${plain}"
-        LOGI "此命令将在每次证书签发和续签时运行。"
-        read -rp "您是否想要修改 ACME 的 --reloadcmd？(y/n): " setReloadcmd
-    else
-        LOGI "Default --reloadcmd for ACME is: ${yellow}ml restart${plain}"
-        LOGI "This command will run on every certificate issue and renew."
-        read -rp "Would you like to modify --reloadcmd for ACME? (y/n): " setReloadcmd
-    fi
-    if [[ "$setReloadcmd" == "y" || "$setReloadcmd" == "Y" ]]; then
-        if is_zh; then
-            echo -e "\n${green}\t1.${plain} 预设: systemctl reload nginx ; ml restart"
-            echo -e "${green}\t2.${plain} 输入自定义命令"
-            echo -e "${green}\t0.${plain} 保持默认重载命令"
-            read -rp "请选择: " choice
-        else
-            echo -e "\n${green}\t1.${plain} Preset: systemctl reload nginx ; ml restart"
-            echo -e "${green}\t2.${plain} Input your own command"
-            echo -e "${green}\t0.${plain} Keep default reloadcmd"
-            read -rp "Choose an option: " choice
-        fi
-        case "$choice" in
-            1)
-                is_zh && LOGI "重载命令设为: systemctl reload nginx ; ml restart" || LOGI "Reloadcmd is: systemctl reload nginx ; ml restart"
-                reloadCmd="systemctl reload nginx ; ml restart"
-                ;;
-            2)
-                if is_zh; then
-                    LOGD "推荐在末尾放置 ml restart，以防其他服务失败时报错退出"
-                    read -rp "请输入您的重载命令 (例如: systemctl reload nginx ; ml restart): " reloadCmd
-                    LOGI "您的重载命令是: ${reloadCmd}"
-                else
-                    LOGD "It's recommended to put ml restart at the end, so it won't raise an error if other services fails"
-                    read -rp "Please enter your reloadcmd (example: systemctl reload nginx ; ml restart): " reloadCmd
-                    LOGI "Your reloadcmd is: ${reloadCmd}"
-                fi
-                ;;
-            *)
-                is_zh && LOGI "保持默认重载命令" || LOGI "Keep default reloadcmd"
-                ;;
-        esac
-    fi
-
-    # install the certificate
-    local installOutput=""
-    installOutput=$(~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file /root/cert/${domain}/privkey.pem \
-        --fullchain-file /root/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
-    local installRc=$?
-    echo "${installOutput}"
-
-    local installWroteFiles=0
-    if echo "${installOutput}" | grep -q "Installing key to:" && echo "${installOutput}" | grep -q "Installing full chain to:"; then
-        installWroteFiles=1
-    fi
-
-    if [[ -f "/root/cert/${domain}/privkey.pem" && -f "/root/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
-        is_zh && LOGI "证书安装成功，正在开启自动更新..." || LOGI "Installing certificate succeeded, enabling auto renew..."
-    else
-        is_zh && LOGE "证书安装失败，退出。" || LOGE "Installing certificate failed, exiting."
-        if [[ ${cert_exists} -eq 0 ]]; then
-            rm -rf ~/.acme.sh/${domain}
-        fi
-        exit 1
-    fi
-
-    # enable auto-renew
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-    if [ $? -ne 0 ]; then
-        if is_zh; then
-            LOGE "开启证书自动更新失败，具体证书信息如下:"
-        else
-            LOGE "Auto renew failed, certificate details:"
-        fi
-        ls -lah cert/*
-        chmod 600 $certPath/privkey.pem
-        chmod 644 $certPath/fullchain.pem
-        exit 1
-    else
-        if is_zh; then
-            LOGI "证书安装完成且自动续签已开启。具体信息如下:"
-        else
-            LOGI "Auto renew succeeded, certificate details:"
-        fi
-        ls -lah cert/*
-        chmod 600 $certPath/privkey.pem
-        chmod 644 $certPath/fullchain.pem
-    fi
-
-    # Prompt user to set panel paths after successful certificate installation
-    if is_zh; then
-        read -rp "是否想要将此证书设置为面板证书路径？(y/n): " setPanel
-    else
-        read -rp "Would you like to set this certificate for the panel? (y/n): " setPanel
-    fi
-    if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
-        local webCertFile="/root/cert/${domain}/fullchain.pem"
-        local webKeyFile="/root/cert/${domain}/privkey.pem"
-
-        if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
-            ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
-            ${xui_folder}/x-ui setting -listenIP 0.0.0.0 > /dev/null 2>&1
-            if is_zh; then
-                LOGI "面板证书路径已设置为域名: $domain"
-                LOGI "  - 证书文件: $webCertFile"
-                LOGI "  - 私钥文件: $webKeyFile"
-                echo -e "${green}访问地址: https://${domain}:${existing_port}${existing_webBasePath}${plain}"
-            else
-                LOGI "Panel paths set for domain: $domain"
-                LOGI "  - Certificate File: $webCertFile"
-                LOGI "  - Private Key File: $webKeyFile"
-                echo -e "${green}Access URL: https://${domain}:${existing_port}${existing_webBasePath}${plain}"
+    case "$method" in
+        1|2)
+            if ! ssl_prepare_http01_firewall; then
+                ssl_commit_acme_state
+                return 1
             fi
-            restart
-        else
-            is_zh && LOGE "错误：未找到域名 $domain 的证书或私钥文件。" || LOGE "Error: Certificate or private key file not found for domain: $domain."
-        fi
-    else
-        is_zh && LOGI "跳过设置面板证书路径。" || LOGI "Skipping panel path setting."
+            ;;
+    esac
+    case "$method" in
+        1)
+            if ! ssl_install_dependencies 1; then
+                ssl_commit_acme_state
+                return 1
+            fi
+            if is_port_in_use 80; then
+                ssl_log_e "TCP 80 已被占用，脚本不会终止未知进程：" \
+                    "TCP 80 is occupied; the script will not kill an unknown process:"
+                ssl_show_port_owner 80
+                is_zh && echo "请先安全停止占用服务，或改用 Webroot。" || echo "Stop it safely or use webroot validation."
+                ssl_commit_acme_state
+                return 1
+            fi
+            issue_args=(--issue --server letsencrypt -d "$domain" --standalone --httpport 80 --keylength "$cert_keylength" --force)
+            ;;
+        2)
+            if ! ssl_prepare_webroot "$domain" "$requested_webroot"; then
+                ssl_commit_acme_state
+                return 1
+            fi
+            issue_args=(--issue --server letsencrypt -d "$domain" --webroot "$SSL_WEBROOT" --keylength "$cert_keylength" --force)
+            ;;
+        *)
+            ssl_log_e "无效选项。" "Invalid option."
+            ssl_commit_acme_state
+            return 1
+            ;;
+    esac
+
+    ssl_log_i "开始签发；主机防火墙已检查，云安全组/云防火墙仍需手动放行公网 TCP 80。" \
+        "Issuing now; the host firewall was checked, but the cloud security group/firewall must still allow public TCP 80."
+    if ! ssl_prepare_acme_deploy_stage "$domain"; then
+        ssl_rollback_acme_state "$domain" || true
+        return 1
     fi
+    if ! "$X_MILI_ACME_BIN" --set-default-ca --server letsencrypt > /dev/null; then
+        ssl_cleanup_acme_deploy_stage
+        ssl_rollback_acme_state "$domain" || true
+        return 1
+    fi
+    if ! "$X_MILI_ACME_BIN" "${issue_args[@]}"; then
+        ssl_cleanup_acme_deploy_stage
+        ssl_rollback_acme_state "$domain" || true
+        ssl_log_e "签发失败。现有面板证书和监听配置未修改。" \
+            "Issuance failed. Existing panel certificate and listener settings were not changed."
+        return 1
+    fi
+    if ssl_finish_issue "$domain"; then
+        ssl_cleanup_acme_deploy_stage
+        return 0
+    fi
+    ssl_cleanup_acme_deploy_stage
+    ssl_rollback_acme_state "$domain" || true
+    return 1
 }
 
 ssl_cert_issue_CF() {
-    local existing_webBasePath=$(${xui_folder}/x-ui setting -show true | grep -Eo 'webBasePath: .+' | awk '{print $2}')
-    local existing_port=$(${xui_folder}/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
+    local requested_domain="${1:-}" domain auth_type token account_id global_key email cert_keylength=ec-256
+    local rc
+    ssl_read_domain "$requested_domain" || return 1
+    domain="$SSL_SELECTED_DOMAIN"
+    install_acme || return 1
+    ssl_backup_acme_state "$domain" || return 1
+    [[ "$(ssl_acme_mode "$domain")" != rsa ]] || cert_keylength=2048
+    unset CF_Token CF_Account_ID CF_Zone_ID CF_Key CF_Email
     if is_zh; then
-        LOGI "****** 使用说明 ******"
-        LOGI "请按照以下步骤完成申请："
-        LOGI "1. 准备 Cloudflare 注册邮箱。"
-        LOGI "2. 准备 Cloudflare Global API Key。"
-        LOGI "3. 准备要申请的域名。"
-        LOGI "4. 证书签发成功后，会提示您是否将证书绑定到面板（可选）。"
-        LOGI "5. 脚本在安装后支持 SSL 证书的自动续签。"
-        confirm "您是否确认上述信息并希望继续？[y/n]" "y"
+        echo -e "${green}1.${plain} Cloudflare API Token（推荐，Zone:DNS:Edit）"
+        echo -e "${green}2.${plain} Global API Key + 邮箱"
+        read -rp "认证方式 [1]: " auth_type
     else
-        LOGI "****** Instructions for Use ******"
-        LOGI "Follow the steps below to complete the process:"
-        LOGI "1. Cloudflare Registered E-mail."
-        LOGI "2. Cloudflare Global API Key."
-        LOGI "3. The Domain Name."
-        LOGI "4. Once the certificate is issued, you will be prompted to set the certificate for the panel (optional)."
-        LOGI "5. The script also supports automatic renewal of the SSL certificate after installation."
-        confirm "Do you confirm the information and wish to proceed? [y/n]" "y"
+        echo -e "${green}1.${plain} Cloudflare API Token (recommended, Zone:DNS:Edit)"
+        echo -e "${green}2.${plain} Global API Key + email"
+        read -rp "Authentication method [1]: " auth_type
+    fi
+    auth_type="${auth_type:-1}"
+    case "$auth_type" in
+        1)
+            is_zh && read -rsp "API Token: " token || read -rsp "API Token: " token
+            echo
+            is_zh && read -rp "Account ID（通常可留空）: " account_id || read -rp "Account ID (usually optional): " account_id
+            [[ -n "$token" ]] || {
+                ssl_log_e "Token 不能为空。" "Token cannot be empty."
+                ssl_commit_acme_state
+                return 1
+            }
+            export CF_Token="$token"
+            [[ -z "$account_id" ]] || export CF_Account_ID="$account_id"
+            ;;
+        2)
+            is_zh && read -rsp "Global API Key: " global_key || read -rsp "Global API Key: " global_key
+            echo
+            is_zh && read -rp "Cloudflare 注册邮箱: " email || read -rp "Cloudflare account email: " email
+            [[ -n "$global_key" && "$email" == *@* ]] || {
+                ssl_log_e "API Key 或邮箱无效。" "Invalid API key or email."
+                ssl_commit_acme_state
+                return 1
+            }
+            export CF_Key="$global_key" CF_Email="$email"
+            ;;
+        *)
+            ssl_log_e "无效选项。" "Invalid option."
+            ssl_commit_acme_state
+            return 1
+            ;;
+    esac
+
+    if ! ssl_prepare_acme_deploy_stage "$domain"; then
+        unset CF_Token CF_Account_ID CF_Zone_ID CF_Key CF_Email token account_id global_key
+        ssl_rollback_acme_state "$domain" || true
+        return 1
+    fi
+    "$X_MILI_ACME_BIN" --set-default-ca --server letsencrypt > /dev/null || rc=$?
+    if [[ ${rc:-0} -eq 0 ]]; then
+        "$X_MILI_ACME_BIN" --issue --server letsencrypt --dns dns_cf \
+            -d "$domain" -d "*.${domain}" --keylength "$cert_keylength" --force
+        rc=$?
+    fi
+    unset CF_Token CF_Account_ID CF_Zone_ID CF_Key CF_Email token account_id global_key
+    if [[ ${rc:-1} -ne 0 ]]; then
+        ssl_cleanup_acme_deploy_stage
+        ssl_rollback_acme_state "$domain" || true
+        ssl_log_e "Cloudflare DNS 验证签发失败；现有配置未修改。" \
+            "Cloudflare DNS issuance failed; existing settings were not changed."
+        return 1
+    fi
+    if ssl_finish_issue "$domain"; then
+        ssl_cleanup_acme_deploy_stage
+        ssl_log_i "Cloudflare 凭据已由 acme.sh 保存到共享 account.conf，供自动续签使用。" \
+            "Cloudflare credentials were saved by acme.sh in shared account.conf for renewal."
+        return 0
+    fi
+    ssl_cleanup_acme_deploy_stage
+    ssl_rollback_acme_state "$domain" || true
+    return 1
+}
+
+ssl_list_domains() {
+    local path name
+    [[ -d "$X_MILI_CERT_ROOT" ]] || return 0
+    for path in "$X_MILI_CERT_ROOT"/*; do
+        [[ -d "$path" ]] || continue
+        name=$(basename "$path")
+        ssl_valid_domain "$name" && printf '%s\n' "$name"
+    done | sort -u
+}
+
+ssl_select_domain() {
+    local input i=1 domain
+    local -a domains=()
+    while IFS= read -r domain; do domains+=("$domain"); done < <(ssl_list_domains)
+    if [[ ${#domains[@]} -eq 0 ]]; then
+        ssl_log_e "没有已安装的域名证书。" "No installed domain certificates were found."
+        return 1
+    fi
+    for domain in "${domains[@]}"; do echo "  $i) $domain"; ((i++)); done
+    is_zh && read -rp "请输入编号或完整域名: " input || read -rp "Enter a number or full domain: " input
+    if [[ "$input" =~ ^[0-9]+$ ]] && ((input >= 1 && input <= ${#domains[@]})); then
+        SSL_SELECTED_DOMAIN="${domains[input-1]}"
+        return 0
+    fi
+    input=$(ssl_normalize_domain "$input")
+    for domain in "${domains[@]}"; do
+        [[ "$input" != "$domain" ]] || { SSL_SELECTED_DOMAIN="$domain"; return 0; }
+    done
+    ssl_log_e "选择无效。" "Invalid selection."
+    return 1
+}
+
+ssl_show_certificates() {
+    local current_cert current_key listen env_file domain cert key expiry issuer
+    current_cert=$(ssl_panel_cert)
+    current_key=$(ssl_panel_key)
+    listen=$(ssl_panel_listen)
+    echo
+    is_zh && echo "面板证书: ${current_cert:-未设置}" || echo "Panel certificate: ${current_cert:-not set}"
+    is_zh && echo "面板私钥: ${current_key:-未设置}" || echo "Panel key: ${current_key:-not set}"
+    is_zh && echo "监听地址: ${listen:-0.0.0.0}" || echo "Listen address: ${listen:-0.0.0.0}"
+    if ssl_insecure_http_enabled; then
+        is_zh && echo -e "公网明文 HTTP: ${red}已显式开启${plain}" || echo -e "Public plaintext HTTP: ${red}explicitly enabled${plain}"
+    else
+        is_zh && echo -e "公网明文 HTTP: ${green}关闭${plain}" || echo -e "Public plaintext HTTP: ${green}disabled${plain}"
+    fi
+    if env_file=$(ssl_service_env_file 2> /dev/null); then
+        is_zh && echo "环境文件: $env_file" || echo "Environment file: $env_file"
+    elif [[ -f /.dockerenv ]]; then
+        is_zh && echo "环境来源: Docker Compose" || echo "Environment source: Docker Compose"
+    fi
+    echo
+    while IFS= read -r domain; do
+        cert="${X_MILI_CERT_ROOT}/${domain}/fullchain.pem"
+        key="${X_MILI_CERT_ROOT}/${domain}/privkey.pem"
+        if ssl_verify_cert_files "$domain" "$cert" "$key"; then
+            expiry=$(openssl x509 -in "$cert" -noout -enddate 2> /dev/null | cut -d= -f2-)
+            issuer=$(openssl x509 -in "$cert" -noout -issuer 2> /dev/null | sed 's/^issuer=//')
+            echo "${domain}"
+            echo "  cert: $cert"
+            echo "  key:  $key"
+            is_zh && echo "  到期: $expiry" || echo "  expires: $expiry"
+            is_zh && echo "  签发者: $issuer" || echo "  issuer: $issuer"
+        else
+            echo -e "${red}${domain}: invalid certificate/key${plain}"
+        fi
+    done < <(ssl_list_domains)
+}
+
+ssl_set_existing_cert() {
+    local domain cert key
+    ssl_select_domain || return 1
+    domain="$SSL_SELECTED_DOMAIN"
+    cert="${X_MILI_CERT_ROOT}/${domain}/fullchain.pem"
+    key="${X_MILI_CERT_ROOT}/${domain}/privkey.pem"
+    ssl_apply_panel_tls "$domain" "$cert" "$key"
+}
+
+ssl_renew_domain() {
+    local domain="$1" force="${2:-false}" mode dest prebackup active=0 rc=0
+    local -a ecc_arg=()
+    local -a force_arg=()
+    ssl_valid_domain "$domain" || return 1
+    [[ -d "${X_MILI_CERT_ROOT}/${domain}" ]] || return 1
+    mode=$(ssl_acme_mode "$domain")
+    [[ "$mode" != none ]] || { ssl_log_e "acme.sh 中没有续签记录。" "No acme.sh renewal record was found."; return 1; }
+    [[ "$mode" != ecc ]] || ecc_arg=(--ecc)
+    ssl_is_true "$force" && force_arg=(--force)
+    dest="${X_MILI_CERT_ROOT}/${domain}"
+    [[ "$(ssl_panel_cert)" == "${dest}/fullchain.pem" ]] && active=1
+    prebackup=$(mktemp -d "${X_MILI_CERT_ROOT}/.${domain}.renew-old.XXXXXX") || return 1
+    cp -a -- "${dest}/." "$prebackup/" || { rm -rf -- "$prebackup"; return 1; }
+    if ! ssl_verify_cert_key_pair "$domain" "${prebackup}/fullchain.pem" "${prebackup}/privkey.pem"; then
+        ssl_log_e "当前证书快照校验失败，未开始续签。" "The current certificate snapshot is invalid; renewal was not started."
+        rm -rf -- "$prebackup"
+        return 1
+    fi
+    ssl_backup_acme_state "$domain" || { rm -rf -- "$prebackup"; return 1; }
+    if ! ssl_prepare_acme_deploy_stage "$domain"; then
+        ssl_rollback_acme_state "$domain" || true
+        rm -rf -- "$prebackup"
+        return 1
     fi
 
-    if [ $? -eq 0 ]; then
-        # Check for acme.sh first
-        if ! command -v ~/.acme.sh/acme.sh &> /dev/null; then
-            is_zh && echo "未找到 acme.sh。我们现在开始安装它。" || echo "acme.sh could not be found. We will install it."
-            install_acme
-            if [ $? -ne 0 ]; then
-                is_zh && LOGE "安装 acme 失败，请检查日志。" || LOGE "Install acme failed, please check logs."
-                exit 1
-            fi
-        fi
-
-        CF_Domain=""
-
-        if is_zh; then
-            LOGD "请输入域名名称:"
-            read -rp "输入您的域名: " CF_Domain
-            LOGD "您的域名已设置为: ${CF_Domain}"
+    "$X_MILI_ACME_BIN" --renew -d "$domain" "${ecc_arg[@]}" "${force_arg[@]}" || rc=$?
+    if [[ $rc -eq 2 && ${#force_arg[@]} -eq 0 ]]; then
+        ssl_cleanup_acme_deploy_stage
+        ssl_rollback_acme_state "$domain" || true
+        rm -rf -- "$prebackup"
+        ssl_log_i "证书尚未到续签时间，已安全跳过：${domain}" \
+            "Certificate is not due yet; safely skipped: ${domain}"
+        return 2
+    fi
+    if [[ $rc -eq 0 ]]; then
+        ssl_install_acme_cert "$domain" || rc=$?
+    fi
+    if [[ $rc -eq 0 && $active -eq 1 ]]; then
+        ssl_apply_panel_tls "$domain" "${dest}/fullchain.pem" "${dest}/privkey.pem" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+        if ssl_restore_cert_snapshot "$domain" "$prebackup"; then
+            [[ $active -eq 0 ]] || restart 0 > /dev/null 2>&1 || true
+            ssl_log_e "续签或验证失败，已恢复旧证书。" "Renewal or verification failed; the old certificate was restored."
         else
-            LOGD "Please set a domain name:"
-            read -rp "Input your domain here: " CF_Domain
-            LOGD "Your domain name is set to: ${CF_Domain}"
+            ssl_log_e "续签失败且自动恢复未完成，请按上方快照路径手动检查。" \
+                "Renewal failed and automatic restore was incomplete; inspect the snapshot path shown above."
         fi
+        ssl_cleanup_acme_deploy_stage
+        ssl_rollback_acme_state "$domain" || true
+        return 1
+    fi
+    ssl_cleanup_acme_deploy_stage
+    ssl_commit_transaction_state
+    rm -rf -- "$prebackup"
+    ssl_log_i "证书续签完成。" "Certificate renewed successfully."
+}
 
-        # Set up Cloudflare API details
-        CF_GlobalKey=""
-        CF_AccountEmail=""
-        if is_zh; then
-            LOGD "请输入 API Key:"
-            read -rp "输入您的 Global API Key: " CF_GlobalKey
-            LOGD "您的 API Key 是: ${CF_GlobalKey}"
+ssl_renew_cert() {
+    ssl_select_domain || return 1
+    ssl_renew_domain "$SSL_SELECTED_DOMAIN" true
+}
 
-            LOGD "请输入 Cloudflare 注册邮箱:"
-            read -rp "输入您的邮箱: " CF_AccountEmail
-            LOGD "您的注册邮箱是: ${CF_AccountEmail}"
-        else
-            LOGD "Please set the API key:"
-            read -rp "Input your key here: " CF_GlobalKey
-            LOGD "Your API key is: ${CF_GlobalKey}"
-
-            LOGD "Please set up registered email:"
-            read -rp "Input your email here: " CF_AccountEmail
-            LOGD "Your registered email address is: ${CF_AccountEmail}"
-        fi
-
-        # Set the default CA to Let's Encrypt
-        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt --force
-        if [ $? -ne 0 ]; then
-            is_zh && LOGE "设置默认 CA 失败，脚本退出..." || LOGE "Default CA, Let'sEncrypt fail, script exiting..."
-            exit 1
-        fi
-
-        export CF_Key="${CF_GlobalKey}"
-        export CF_Email="${CF_AccountEmail}"
-
-        # Issue the certificate using Cloudflare DNS
-        ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${CF_Domain} -d *.${CF_Domain} --log --force
-        if [ $? -ne 0 ]; then
-            is_zh && LOGE "证书签发失败，脚本退出..." || LOGE "Certificate issuance failed, script exiting..."
-            exit 1
-        fi
-
-        # Install the certificate
-        certPath="/root/cert/${CF_Domain}"
-        if [ -d "$certPath" ]; then
-            rm -rf ${certPath}
-        fi
-
-        mkdir -p ${certPath}
-        if [ $? -ne 0 ]; then
-            is_zh && LOGE "无法创建目录: ${certPath}" || LOGE "Failed to create directory: ${certPath}"
-            exit 1
-        fi
-
-        reloadCmd="ml restart"
-
-        if is_zh; then
-            LOGI "ACME 的默认重载命令 --reloadcmd 为: ${yellow}ml restart${plain}"
-            LOGI "此命令将在每次证书签发和续签时运行。"
-            read -rp "您是否想要修改 ACME 的 --reloadcmd？(y/n): " setReloadcmd
-        else
-            LOGI "Default --reloadcmd for ACME is: ${yellow}ml restart${plain}"
-            LOGI "This command will run on every certificate issue and renew."
-            read -rp "Would you like to modify --reloadcmd for ACME? (y/n): " setReloadcmd
-        fi
-        if [[ "$setReloadcmd" == "y" || "$setReloadcmd" == "Y" ]]; then
+ssl_choose_http_fallback() {
+    local choice
+    if is_zh; then
+        echo -e "${green}1.${plain} 临时公网 IP HTTP（0.0.0.0 + 显式不安全开关）"
+        echo -e "${green}2.${plain} 安全本机模式（127.0.0.1，需 SSH 隧道）"
+        read -rp "关闭 TLS 后的访问方式 [2]: " choice
+    else
+        echo -e "${green}1.${plain} Temporary public-IP HTTP (0.0.0.0 + explicit insecure opt-in)"
+        echo -e "${green}2.${plain} Safe localhost mode (127.0.0.1; use an SSH tunnel)"
+        read -rp "Access mode after disabling TLS [2]: " choice
+    fi
+    choice="${choice:-2}"
+    case "$choice" in
+        1)
             if is_zh; then
-                echo -e "\n${green}\t1.${plain} 预设: systemctl reload nginx ; ml restart"
-                echo -e "${green}\t2.${plain} 输入自定义命令"
-                echo -e "${green}\t0.${plain} 保持默认重载命令"
-                read -rp "请选择: " choice
+                confirm "公网明文会暴露账号、密码和订阅令牌，确认仅临时开启？" "n" || return 1
             else
-                echo -e "\n${green}\t1.${plain} Preset: systemctl reload nginx ; ml restart"
-                echo -e "${green}\t2.${plain} Input your own command"
-                echo -e "${green}\t0.${plain} Keep default reloadcmd"
-                read -rp "Choose an option: " choice
+                confirm "Public plaintext exposes credentials and subscription tokens. Enable temporarily?" "n" || return 1
             fi
-            case "$choice" in
-                1)
-                    is_zh && LOGI "重载命令设为: systemctl reload nginx ; ml restart" || LOGI "Reloadcmd is: systemctl reload nginx ; ml restart"
-                    reloadCmd="systemctl reload nginx ; ml restart"
-                    ;;
-                2)
-                    if is_zh; then
-                        LOGD "推荐在末尾放置 ml restart，以防其他服务失败时报错退出"
-                        read -rp "请输入您的重载命令 (例如: systemctl reload nginx ; ml restart): " reloadCmd
-                        LOGI "您的重载命令是: ${reloadCmd}"
-                    else
-                        LOGD "It's recommended to put ml restart at the end, so it won't raise an error if other services fails"
-                        read -rp "Please enter your reloadcmd (example: systemctl reload nginx ; ml restart): " reloadCmd
-                        LOGI "Your reloadcmd is: ${reloadCmd}"
-                    fi
-                    ;;
-                *)
-                    is_zh && LOGI "保持默认重载命令" || LOGI "Keep default reloadcmd"
-                    ;;
-            esac
-        fi
-        ~/.acme.sh/acme.sh --installcert -d ${CF_Domain} -d *.${CF_Domain} \
-            --key-file ${certPath}/privkey.pem \
-            --fullchain-file ${certPath}/fullchain.pem --reloadcmd "${reloadCmd}"
+            SSL_DISABLE_MODE=public
+            ;;
+        2) SSL_DISABLE_MODE=local ;;
+        *) return 1 ;;
+    esac
+}
 
-        if [ $? -ne 0 ]; then
-            is_zh && LOGE "证书安装失败，脚本退出..." || LOGE "Certificate installation failed, script exiting..."
-            exit 1
-        else
-            if is_zh; then
-                LOGI "证书安装完成且自动续签已开启。具体信息如下:"
-            else
-                LOGI "Certificate installed successfully, Turning on automatic updates..."
-            fi
+ssl_disable_tls() {
+    local mode="$1" old_cert old_key old_listen old_insecure=false listen insecure port public_ip
+    old_cert=$(ssl_panel_cert)
+    old_key=$(ssl_panel_key)
+    old_listen=$(ssl_panel_listen)
+    ssl_insecure_http_enabled && old_insecure=true
+    SSL_PANEL_OLD_CERT="$old_cert"
+    SSL_PANEL_OLD_KEY="$old_key"
+    SSL_PANEL_OLD_LISTEN="$old_listen"
+    SSL_PANEL_OLD_INSECURE="$old_insecure"
+    SSL_PANEL_ROLLBACK_ACTIVE=1
+    if [[ "$mode" == public ]]; then
+        listen=0.0.0.0
+        insecure=true
+    else
+        listen=127.0.0.1
+        insecure=false
+    fi
+    if ! ssl_set_insecure_http "$insecure" \
+        || ! ssl_set_panel_cert "" "" \
+        || ! ssl_set_panel_listen "$listen" \
+        || ! restart 0 \
+        || ! ssl_verify_local_http; then
+        ssl_log_e "关闭 TLS 失败，正在恢复原配置。" "Failed to disable TLS; restoring the previous configuration."
+        ssl_restore_panel_state "$old_cert" "$old_key" "$old_listen" "$old_insecure" \
+            && ssl_commit_panel_state
+        return 1
+    fi
+    port=$(ssl_panel_port)
+    if [[ "$mode" == public ]]; then
+        if [[ ! -f /.dockerenv ]] && ! ssl_public_listener_active "$port"; then
+            ssl_log_e "未检测到公网监听，正在恢复原配置。" "No public listener was detected; restoring the previous configuration."
+            ssl_restore_panel_state "$old_cert" "$old_key" "$old_listen" "$old_insecure" \
+                && ssl_commit_panel_state
+            return 1
         fi
+        public_ip=$(ssl_get_public_ipv4 || echo "SERVER_IP")
+        echo -e "${yellow}http://${public_ip}:${port}$(ssl_panel_path)${plain}"
+        ssl_log_i "仅作首次配置，请尽快重新绑定域名证书。" "Use only for initial setup; bind a domain certificate as soon as possible."
+    else
+        echo -e "${yellow}ssh -L ${port}:127.0.0.1:${port} root@SERVER_IP${plain}"
+        echo -e "${green}http://127.0.0.1:${port}$(ssl_panel_path)${plain}"
+    fi
+}
 
-        # Enable auto-update
-        ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-        if [ $? -ne 0 ]; then
-            is_zh && LOGE "自动更新设置失败，脚本退出..." || LOGE "Auto update setup failed, script exiting..."
-            exit 1
-        else
-            if is_zh; then
-                LOGI "证书安装完成且自动续签已开启。具体信息如下:"
-            else
-                LOGI "The certificate is installed and auto-renewal is turned on. Specific information is as follows:"
-            fi
-            ls -lah ${certPath}/*
-            chmod 600 ${certPath}/privkey.pem
-            chmod 644 ${certPath}/fullchain.pem
-        fi
+ssl_disable_tls_menu() {
+    ssl_choose_http_fallback || return 1
+    ssl_disable_tls "$SSL_DISABLE_MODE"
+}
 
-        # Prompt user to set panel paths after successful certificate installation
+ssl_revoke_delete_cert() {
+    local domain mode cert_path quarantine active=0 disabled=0
+    local -a ecc_arg=()
+    ssl_select_domain || return 1
+    domain="$SSL_SELECTED_DOMAIN"
+    if is_zh; then
+        confirm "确认吊销并删除 ${domain} 的证书？此操作不可撤销。" "n" || return 0
+    else
+        confirm "Revoke and delete ${domain}? This cannot be undone." "n" || return 0
+    fi
+    mode=$(ssl_acme_mode "$domain")
+    if [[ "$mode" == none ]]; then
         if is_zh; then
-            read -rp "是否想要将此证书设置为面板证书路径？(y/n): " setPanel
+            confirm "没有 ACME 记录，只删除本地证书文件？" "n" || return 0
         else
-            read -rp "Would you like to set this certificate for the panel? (y/n): " setPanel
-        fi
-        if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
-            local webCertFile="${certPath}/fullchain.pem"
-            local webKeyFile="${certPath}/privkey.pem"
-
-            if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
-                ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
-                ${xui_folder}/x-ui setting -listenIP 0.0.0.0 > /dev/null 2>&1
-                if is_zh; then
-                    LOGI "面板证书路径已设置为域名: $CF_Domain"
-                    LOGI "  - 证书文件: $webCertFile"
-                    LOGI "  - 私钥文件: $webKeyFile"
-                    echo -e "${green}访问地址: https://${CF_Domain}:${existing_port}${existing_webBasePath}${plain}"
-                else
-                    LOGI "Panel paths set for domain: $CF_Domain"
-                    LOGI "  - Certificate File: $webCertFile"
-                    LOGI "  - Private Key File: $webKeyFile"
-                    echo -e "${green}Access URL: https://${CF_Domain}:${existing_port}${existing_webBasePath}${plain}"
-                fi
-                restart
-            else
-                is_zh && LOGE "错误：未找到域名 $CF_Domain 的证书或私钥文件。" || LOGE "Error: Certificate or private key file not found for domain: $CF_Domain."
-            fi
-        else
-            is_zh && LOGI "跳过设置面板证书路径。" || LOGI "Skipping panel path setting."
+            confirm "No ACME record exists. Delete only the local files?" "n" || return 0
         fi
     fi
+    cert_path="${X_MILI_CERT_ROOT}/${domain}"
+    if [[ ! -d "$cert_path" || -L "$cert_path" ]]; then
+        ssl_log_e "证书目标不是安全的实体目录，已中止删除。" \
+            "The certificate target is not a safe physical directory; deletion was aborted."
+        return 1
+    fi
+    [[ "$(ssl_panel_cert)" == "${cert_path}/fullchain.pem" ]] && active=1
+    if [[ $active -eq 1 ]]; then
+        ssl_choose_http_fallback || return 1
+        ssl_disable_tls "$SSL_DISABLE_MODE" || return 1
+        disabled=1
+    fi
+    if [[ "$mode" != none ]]; then
+        [[ "$mode" != ecc ]] || ecc_arg=(--ecc)
+        # Revocation is irreversible. From this point, an interrupt with an
+        # unknown command outcome must keep the selected HTTP fallback rather
+        # than risk serving a certificate that may already be revoked.
+        [[ $disabled -eq 0 ]] || SSL_PANEL_ROLLBACK_FORBIDDEN=1
+        if ! "$X_MILI_ACME_BIN" --revoke -d "$domain" "${ecc_arg[@]}"; then
+            SSL_PANEL_ROLLBACK_FORBIDDEN=0
+            ssl_log_e "吊销失败，证书文件未删除。" "Revocation failed; certificate files were not deleted."
+            return 1
+        fi
+        [[ $disabled -eq 0 ]] || ssl_commit_panel_state
+        if ! "$X_MILI_ACME_BIN" --remove -d "$domain" "${ecc_arg[@]}"; then
+            [[ $disabled -eq 0 ]] || ssl_log_e \
+                "证书已吊销，面板将保持所选 HTTP 回退模式，不会重新启用该证书。" \
+                "The certificate is revoked; the panel remains in the selected HTTP fallback mode and will not re-enable it."
+            ssl_log_e "证书已吊销，但移除 acme.sh 记录失败；本地文件暂未删除。" \
+                "Certificate was revoked, but removing its acme.sh record failed; local files were kept."
+            return 1
+        fi
+    fi
+    # Rename inside CERT_ROOT first. The same-filesystem rename is atomic, so a
+    # failed move leaves the live directory intact and safe to re-bind.
+    if [[ "$mode" == none && $disabled -eq 1 ]]; then
+        SSL_PANEL_ROLLBACK_FORBIDDEN=1
+    fi
+    quarantine="${X_MILI_CERT_ROOT}/.${domain}.delete.$(date +%s).$$"
+    if ! mv -- "$cert_path" "$quarantine"; then
+        [[ "$mode" != none || $disabled -eq 0 ]] || SSL_PANEL_ROLLBACK_FORBIDDEN=0
+        ssl_log_e "无法原子隔离证书目录；原文件保持不变。" \
+            "Could not atomically quarantine the certificate directory; original files are unchanged."
+        return 1
+    fi
+    if [[ "$mode" == none && $disabled -eq 1 ]]; then
+        ssl_commit_panel_state
+    fi
+    if ! rm -rf -- "$quarantine"; then
+        ssl_log_e "证书已从活动路径隔离，但清理未完成：${quarantine}" \
+            "The certificate was quarantined from its active path, but cleanup is incomplete: ${quarantine}"
+        return 1
+    fi
+    ssl_log_i "证书已吊销并删除：${domain}" "Certificate revoked and deleted: ${domain}"
+}
+
+ssl_cert_issue_main() {
+    local choice
+    while true; do
+        echo
+        if is_zh; then
+            echo -e "${green}1.${plain} 申请/替换域名证书（HTTP-01）"
+            echo -e "${green}2.${plain} Cloudflare DNS 申请（支持通配符）"
+            echo -e "${green}3.${plain} 查看证书与当前 TLS 状态"
+            echo -e "${green}4.${plain} 强制续签证书"
+            echo -e "${green}5.${plain} 将已有证书绑定到面板"
+            echo -e "${green}6.${plain} 吊销并删除证书"
+            echo -e "${green}7.${plain} 关闭 TLS / 选择 HTTP 回退模式"
+            echo -e "${green}0.${plain} 返回"
+            read -rp "请选择: " choice
+        else
+            echo -e "${green}1.${plain} Issue/replace a domain certificate (HTTP-01)"
+            echo -e "${green}2.${plain} Issue with Cloudflare DNS (wildcard supported)"
+            echo -e "${green}3.${plain} Show certificates and current TLS state"
+            echo -e "${green}4.${plain} Force-renew a certificate"
+            echo -e "${green}5.${plain} Bind an existing certificate to the panel"
+            echo -e "${green}6.${plain} Revoke and delete a certificate"
+            echo -e "${green}7.${plain} Disable TLS / choose HTTP fallback mode"
+            echo -e "${green}0.${plain} Back"
+            read -rp "Choose an option: " choice
+        fi
+        case "$choice" in
+            1) ssl_with_transaction ssl_cert_issue || true ;;
+            2) ssl_with_transaction ssl_cert_issue_CF || true ;;
+            3) ssl_show_certificates ;;
+            4) ssl_with_transaction ssl_renew_cert || true ;;
+            5) ssl_with_transaction ssl_set_existing_cert || true ;;
+            6) ssl_with_transaction ssl_revoke_delete_cert || true ;;
+            7) ssl_with_transaction ssl_disable_tls_menu || true ;;
+            0) return 0 ;;
+            *) ssl_log_e "无效选项。" "Invalid option." ;;
+        esac
+    done
+}
+
+ssl_run_cron() {
+    local domain rc failed=0 renewed=0 skipped=0
+    [[ -x "$X_MILI_ACME_BIN" ]] || {
+        ssl_log_e "acme.sh 尚未安装。" "acme.sh is not installed."
+        return 1
+    }
+    while IFS= read -r domain; do
+        [[ "$(ssl_acme_mode "$domain")" != none ]] || continue
+        if ssl_renew_domain "$domain" false; then
+            rc=0
+        else
+            rc=$?
+        fi
+        case "$rc" in
+            0) ((renewed += 1)) ;;
+            2) ((skipped += 1)) ;;
+            *) ((failed += 1)) ;;
+        esac
+    done < <(ssl_list_domains)
+    ssl_log_i "自动续签检查完成：续签 ${renewed}，跳过 ${skipped}，失败 ${failed}。" \
+        "Renewal check complete: renewed ${renewed}, skipped ${skipped}, failed ${failed}."
+    [[ $failed -eq 0 ]]
+}
+
+ssl_command() {
+    local action="${1:-menu}"
+    [[ $# -eq 0 ]] || shift
+    case "$action" in
+        menu) ssl_cert_issue_main ;;
+        issue) ssl_with_transaction ssl_cert_issue "$@" ;;
+        cloudflare|cf) ssl_with_transaction ssl_cert_issue_CF "$@" ;;
+        show|status) ssl_show_certificates ;;
+        cron) ssl_with_transaction ssl_run_cron ;;
+        *)
+            if is_zh; then
+                echo "用法: ml ssl [menu|show|issue <域名> [standalone|webroot] [webroot目录]|cloudflare <域名>]"
+            else
+                echo "Usage: ml ssl [menu|show|issue <domain> [standalone|webroot] [webroot-path]|cloudflare <domain>]"
+            fi
+            return 2
+            ;;
+    esac
 }
 
 run_speedtest() {
@@ -2549,6 +3930,13 @@ SSH_port_forwarding() {
 
 show_usage() {
     if is_zh; then
+        echo -e "${blue}ml ssl${plain}                    - SSL 证书管理"
+        echo -e "${blue}ml ssl issue <域名> standalone${plain} - 使用 HTTP-01 申请并绑定"
+    else
+        echo -e "${blue}ml ssl${plain}                    - SSL certificate management"
+        echo -e "${blue}ml ssl issue <domain> standalone${plain} - issue and bind with HTTP-01"
+    fi
+    if is_zh; then
         echo -e "┌────────────────────────────────────────────────────────────────┐
 │  ${blue}X-MILI 控制菜单用法（子命令）:${plain}                              │
 │                                                                │
@@ -2734,7 +4122,7 @@ show_menu() {
             ssl_cert_issue_main
             ;;
         19)
-            ssl_cert_issue_CF
+            ssl_with_transaction ssl_cert_issue_CF
             ;;
         20)
             iplimit_main
@@ -2760,7 +4148,7 @@ show_menu() {
     esac
 }
 
-if [[ $# > 0 ]]; then
+if [[ $# -gt 0 ]]; then
     case $1 in
         "start")
             check_install 0 && start 0
@@ -2779,6 +4167,13 @@ if [[ $# > 0 ]]; then
             ;;
         "settings")
             check_install 0 && check_config 0
+            ;;
+        "ssl")
+            shift
+            check_install 0 && ssl_command "$@"
+            ;;
+        "ssl-reload")
+            check_install 0 && restart 0
             ;;
         "enable")
             check_install 0 && enable 0
