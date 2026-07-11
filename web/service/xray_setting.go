@@ -27,6 +27,17 @@ func (s *XraySettingService) SaveXraySetting(newXraySettings string) error {
 	if hoisted, err := EnsureStatsRouting(newXraySettings); err == nil {
 		newXraySettings = hoisted
 	}
+	settings, err := s.SettingService.GetAllSetting()
+	if err != nil {
+		return err
+	}
+	xrayConfig := &xray.Config{}
+	if err := json.Unmarshal([]byte(newXraySettings), xrayConfig); err != nil {
+		return common.NewError("xray template config invalid:", err)
+	}
+	if err := validateXrayConfigListenerPortConflicts(settings, xrayConfig); err != nil {
+		return err
+	}
 	return s.SettingService.saveSetting("xrayTemplateConfig", newXraySettings)
 }
 

@@ -77,6 +77,17 @@ func TestValidateListenerPortConflictsRejectsOverlappingPanelAndSubscription(t *
 	}
 }
 
+func TestListenerAddressesOverlapTreatsExpandedIPv6UnspecifiedAsWildcard(t *testing.T) {
+	for _, address := range []string{
+		"0:0:0:0:0:0:0:0",
+		"::ffff:0.0.0.0",
+	} {
+		if !listenerAddressesOverlap(address, "192.0.2.10") {
+			t.Fatalf("%q was not treated as a wildcard listener", address)
+		}
+	}
+}
+
 func TestValidateListenerPortConflictsAllowsInactiveOrDisjointSubscription(t *testing.T) {
 	tests := []struct {
 		name     string

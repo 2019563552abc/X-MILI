@@ -131,3 +131,29 @@ func TestSetPortRejectsInboundConflictBeforeSave(t *testing.T) {
 		t.Fatalf("web port = %d, want original 2053 after rejected CLI update", port)
 	}
 }
+
+func TestSaveXraySettingRejectsServicePortConflictBeforeSave(t *testing.T) {
+	setupSecuritySettingsDB(t)
+	settings := &SettingService{}
+	original, err := settings.GetXrayConfigTemplate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	template := `{
+		"inbounds":[{"listen":"127.0.0.1","port":2053,"tag":"template-panel-collision"}],
+		"outbounds":[]
+	}`
+	err = (&XraySettingService{}).SaveXraySetting(template)
+	if err == nil || !strings.Contains(err.Error(), "panel") {
+		t.Fatalf("SaveXraySetting() error = %v, want panel listener conflict", err)
+	}
+
+	persisted, err := settings.GetXrayConfigTemplate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted != original {
+		t.Fatal("rejected Xray template replaced the stored template")
+	}
+}

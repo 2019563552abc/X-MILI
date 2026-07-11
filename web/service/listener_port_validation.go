@@ -160,6 +160,9 @@ func canonicalListenerAddress(address string) string {
 	if ip == nil {
 		return strings.ToLower(address)
 	}
+	if ip.IsUnspecified() {
+		return "*"
+	}
 	if ip4 := ip.To4(); ip4 != nil {
 		return ip4.String()
 	}
