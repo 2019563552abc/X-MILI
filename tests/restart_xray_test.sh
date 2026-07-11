@@ -41,6 +41,9 @@ ps() {
 EOF
 }
 main_xray_pids=""
+# The real function is extracted from x-ui.sh and sourced above; ShellCheck
+# cannot follow that generated library and only sees the later test double.
+# shellcheck disable=SC2218
 xray_pid_snapshot main_xray_pids
 [[ "$main_xray_pids" == "100 " ]] \
     || fail "main Xray PID filter included a test or unrelated process: $main_xray_pids"
