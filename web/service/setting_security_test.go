@@ -3,6 +3,7 @@
 package service
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -56,7 +57,15 @@ func TestFreshSettingsUseSafePanelAndSubscriptionDefaults(t *testing.T) {
 
 func TestDefaultSettingsIncludePanelAndSubscriptionPorts(t *testing.T) {
 	setupSecuritySettingsDB(t)
+	logDir := t.TempDir()
+	binDir := t.TempDir()
+	t.Setenv("XUI_LOG_FOLDER", logDir)
+	t.Setenv("XUI_BIN_FOLDER", binDir)
+	if err := os.WriteFile(filepath.Join(binDir, "config.json"), []byte(`{"log":{"access":"none"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	xuilogger.InitLogger(logging.ERROR)
+	t.Cleanup(xuilogger.CloseLogger)
 
 	value, err := (&SettingService{}).GetDefaultSettings("127.0.0.1")
 	if err != nil {
